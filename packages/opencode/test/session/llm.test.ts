@@ -2188,6 +2188,99 @@ describe("session.llm.stream", () => {
     },
   )
 
+  const outputLimitChunks = () => [
+    {
+      type: "message_start",
+      message: {
+        id: "msg-output-limit",
+        model: "claude",
+        usage: { input_tokens: 3, cache_creation_input_tokens: null, cache_read_input_tokens: null },
+      },
+    },
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+    { type: "content_block_stop", index: 0 },
+    {
+      type: "message_delta",
+      delta: { stop_reason: "end_turn", stop_sequence: null, container: null },
+      usage: { input_tokens: 3, output_tokens: 2, cache_creation_input_tokens: null, cache_read_input_tokens: null },
+    },
+    { type: "message_stop" },
+  ]
+
+  const sendWithOutputLimit = (modelID: string, variant: string, maxOutputTokens: number) =>
+    Effect.gen(function* () {
+      const request = waitRequest("/messages", createEventResponse(outputLimitChunks()))
+      const resolved = yield* Provider.use.getModel(ProviderV2.ID.make("anthropic"), ModelV2.ID.make(modelID))
+      const sessionID = SessionID.make("session-test-output-limit")
+      const agent = {
+        name: "test",
+        mode: "primary",
+        options: {},
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      } satisfies Agent.Info
+      yield* drain({
+        user: {
+          id: MessageID.make("msg_user-output-limit"),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID: ProviderV2.ID.make("anthropic"), modelID: resolved.id, variant },
+        } satisfies SessionV1.User,
+        sessionID,
+        model: resolved,
+        agent,
+        system: [],
+        messages: [{ role: "user", content: "Hello" }],
+        tools: {},
+        maxOutputTokens,
+      })
+      return (yield* Effect.promise(() => request)).body
+    })
+
+  const anthropicConfig = (modelID: string) => () => {
+    const model = loadFixture("anthropic", modelID).model
+    return {
+      enabled_providers: ["anthropic"],
+      provider: {
+        anthropic: {
+          name: "Anthropic",
+          env: ["ANTHROPIC_API_KEY"],
+          npm: "@ai-sdk/anthropic",
+          api: "https://api.anthropic.com/v1",
+          models: { [model.id]: configModel(model) as ConfigModel },
+          options: { apiKey: "test-anthropic-key", baseURL: `${state.server!.url.origin}/v1` },
+        },
+      },
+    }
+  }
+
+  it.instance(
+    "keeps max_tokens within maxOutputTokens, thinking budget included",
+    () =>
+      Effect.gen(function* () {
+        const roomy = yield* sendWithOutputLimit("claude-sonnet-4-5", "high", 20_000)
+        expect(roomy.thinking).toEqual({ type: "enabled", budget_tokens: 16_000 })
+        expect(roomy.max_tokens).toBe(20_000)
+
+        const tight = yield* sendWithOutputLimit("claude-sonnet-4-5", "high", 16_000)
+        expect(tight.max_tokens).toBe(16_001)
+      }),
+    { config: anthropicConfig("claude-sonnet-4-5") },
+  )
+
+  it.instance(
+    "lowers max_tokens to maxOutputTokens with adaptive thinking",
+    () =>
+      Effect.gen(function* () {
+        const body = yield* sendWithOutputLimit("claude-opus-4-6", "max", 5_000)
+        expect(body.thinking).toMatchObject({ type: "adaptive" })
+        expect(body.max_tokens).toBe(5_000)
+      }),
+    { config: anthropicConfig("claude-opus-4-6") },
+  )
+
   const geminiFixture = { providerID: "google", modelID: "gemini-2.5-flash" }
   it.instance(
     "sends Google API payload for Gemini models",

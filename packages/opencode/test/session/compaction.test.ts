@@ -3,7 +3,9 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { APICallError } from "ai"
+import { APICallError, tool } from "ai"
+import z from "zod"
+import type { Agent } from "@/agent/agent"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Config } from "@/config/config"
@@ -217,9 +219,18 @@ function processorLayer(result: "continue" | "compact") {
   )
 }
 
-function cfg(compaction?: ConfigV1.Info["compaction"]) {
+function cfg(compaction?: ConfigV1.Info["compaction"], agent?: ConfigV1.Info["agent"]) {
   const base = Schema.decodeUnknownSync(ConfigV1.Info)({}) as ConfigV1.Info
-  return Layer.succeed(Config.Service, TestConfig.make({ get: () => Effect.succeed({ ...base, compaction }) }))
+  return Layer.succeed(Config.Service, TestConfig.make({ get: () => Effect.succeed({ ...base, compaction, agent }) }))
+}
+
+function small() {
+  const session = createModel({ context: 100_000, output: 32_000 })
+  const compact = { ...createModel({ context: 8_000, output: 2_000 }), id: ModelV2.ID.make("small-model") }
+  return ProviderTest.fake({
+    model: session,
+    getModel: (_providerID, modelID) => Effect.succeed(modelID === compact.id ? compact : session),
+  })
 }
 
 const defaultProvider = wide()
@@ -337,29 +348,142 @@ function reply(
   }
 }
 
-function tooLong(capture?: (input: LLM.StreamInput) => void) {
+function tooLongError() {
   const message = "prompt is too long: 1037248 tokens > 1000000 maximum"
+  return new APICallError({
+    message,
+    url: "https://example.com/v1/messages",
+    requestBodyValues: {},
+    statusCode: 400,
+    responseHeaders: { "content-type": "application/json" },
+    responseBody: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }),
+    isRetryable: false,
+  })
+}
+
+function tooLong(capture?: (input: LLM.StreamInput) => void) {
   return (input: LLM.StreamInput) => {
     capture?.(input)
-    return Stream.fail(
-      new APICallError({
-        message,
-        url: "https://example.com/v1/messages",
-        requestBodyValues: {},
-        statusCode: 400,
-        responseHeaders: { "content-type": "application/json" },
-        responseBody: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }),
-        isRetryable: false,
-      }),
+    return Stream.fail(tooLongError())
+  }
+}
+
+function partialThenTooLong(capture?: (input: LLM.StreamInput) => void) {
+  return (input: LLM.StreamInput) => {
+    capture?.(input)
+    return Stream.make(
+      LLMEvent.textStart({ id: "txt-0" }),
+      LLMEvent.textDelta({ id: "txt-0", text: "partial" }),
+    ).pipe(Stream.concat(Stream.fail(tooLongError())))
+  }
+}
+
+function toolCall(capture?: (input: LLM.StreamInput) => void) {
+  return (input: LLM.StreamInput) => {
+    capture?.(input)
+    return Stream.make(
+      LLMEvent.toolInputStart({ id: "call-1", name: "probe" }),
+      LLMEvent.toolCall({ id: "call-1", name: "probe", input: {} }),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: basicUsage() }),
+      LLMEvent.finish({ reason: "tool-calls", usage: basicUsage() }),
     )
   }
 }
 
-function createTurns(sessionID: SessionID, count: number) {
+function empty(capture?: (input: LLM.StreamInput) => void) {
+  return (input: LLM.StreamInput) => {
+    capture?.(input)
+    return Stream.make(
+      LLMEvent.stepFinish({ index: 0, reason: "stop", usage: basicUsage() }),
+      LLMEvent.finish({ reason: "stop", usage: basicUsage() }),
+    )
+  }
+}
+
+const headed = (text: string) => `## Objective\n- ${text}`
+
+const textOf = (input: LLM.StreamInput) => JSON.stringify(input.messages)
+
+function createTurns(sessionID: SessionID, count: number, size = 100) {
   return Effect.forEach(
     Array.from({ length: count }, (_, index) => index + 1),
-    (turn) => createUserMessage(sessionID, `turn-${turn} ${"x".repeat(100)}`),
+    (turn) => createUserMessage(sessionID, `turn-${turn} ${"x".repeat(size)}`),
   )
+}
+
+function summaryOf(sessionID: SessionID) {
+  return SessionNs.use
+    .messages({ sessionID })
+    .pipe(Effect.map((messages) => messages.findLast((msg) => msg.info.role === "assistant" && msg.info.summary)))
+}
+
+function countErrors(sessionID: SessionID) {
+  return Effect.gen(function* () {
+    const events = yield* EventV2Bridge.Service
+    const seen = { count: 0 }
+    const off = yield* events.listen((evt) => {
+      if (evt.type !== SessionNs.Event.Error.type) return Effect.void
+      if ((evt.data as typeof SessionNs.Event.Error.data.Type).sessionID === sessionID) seen.count++
+      return Effect.void
+    })
+    yield* Effect.addFinalizer(() => off)
+    return seen
+  })
+}
+
+function createMeasuredTurn(
+  sessionID: SessionID,
+  root: string,
+  input: number,
+  options?: { variant?: string; format?: SessionV1.User["format"] },
+) {
+  return Effect.gen(function* () {
+    const ssn = yield* SessionNs.Service
+    const ask = yield* ssn.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID,
+      agent: "build",
+      model: ref,
+      format: options?.format,
+      time: { created: Date.now() },
+    })
+    yield* ssn.updatePart({ id: PartID.ascending(), messageID: ask.id, sessionID, type: "text", text: "do the task" })
+    const answer = yield* createAssistantMessage(sessionID, ask.id, root)
+    yield* ssn.updateMessage({
+      ...answer,
+      variant: options?.variant,
+      tokens: { input, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
+    })
+    yield* ssn.updatePart({
+      id: PartID.ascending(),
+      messageID: answer.id,
+      sessionID,
+      type: "text",
+      text: "working on it",
+    })
+  })
+}
+
+function liveRequest(calls: Array<Parameters<SessionCompaction.Live>[0]>): SessionCompaction.Live {
+  return (input) => {
+    calls.push(input)
+    return Effect.succeed({
+      user: input.user,
+      agent: { name: "build", mode: "primary", options: {}, permission: [] } satisfies Agent.Info,
+      sessionID: input.user.sessionID,
+      system: ["live system"],
+      messages: [
+        { role: "user", content: [{ type: "text", text: "live prefix" }] },
+        {
+          role: "user",
+          content: input.prompt.parts.flatMap((part) => (part.type === "text" ? [{ type: "text", text: part.text }] : [])),
+        },
+      ],
+      tools: { probe: tool({ description: "probe", inputSchema: z.object({}), execute: async () => "ran" }) },
+      model: input.model,
+    })
+  }
 }
 
 function plugin(ready: Deferred.Deferred<void>) {
@@ -382,6 +506,20 @@ function autocontinue(enabled: boolean) {
       if (name !== "experimental.compaction.autocontinue") return Effect.succeed(output)
       return Effect.sync(() => {
         ;(output as { enabled: boolean }).enabled = enabled
+        return output
+      })
+    },
+    list: () => Effect.succeed([]),
+    init: () => Effect.void,
+  })
+}
+
+function compactionPrompt(prompt: string) {
+  return Layer.mock(Plugin.Service)({
+    trigger: <Name extends string, Input, Output>(name: Name, _input: Input, output: Output) => {
+      if (name !== "experimental.session.compacting") return Effect.succeed(output)
+      return Effect.sync(() => {
+        ;(output as { prompt?: string }).prompt = prompt
         return output
       })
     },
@@ -974,17 +1112,18 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
-    "sends a summary request the model refuses as too long again without the oldest history",
+    "shortens a summary request the model refuses as too long, keeping the opening and newest exchanges",
     () => {
       const stub = llm()
       const requests: string[] = []
-      const capture = (input: LLM.StreamInput) => requests.push(JSON.stringify(input.messages))
-      stub.push(tooLong(capture))
-      stub.push(reply("summary", capture))
+      const capture = (input: LLM.StreamInput) => requests.push(textOf(input))
+      for (let i = 0; i < 3; i++) stub.push(tooLong(capture))
+      stub.push(reply(headed("summary"), capture))
       return Effect.gen(function* () {
         const ssn = yield* SessionNs.Service
         const session = yield* ssn.create({})
-        yield* createTurns(session.id, 4)
+        const errors = yield* countErrors(session.id)
+        yield* createTurns(session.id, 6, 4_000)
         yield* createSummaryCompaction(session.id)
 
         const msgs = yield* ssn.messages({ sessionID: session.id })
@@ -994,34 +1133,37 @@ describe("session.compaction.process", () => {
           sessionID: session.id,
           auto: false,
         })
-        const summaries = (yield* ssn.messages({ sessionID: session.id })).filter(
-          (msg) => msg.info.role === "assistant" && msg.info.summary,
-        )
+        const summary = yield* summaryOf(session.id)
 
         expect(result).toBe("continue")
-        expect(requests).toHaveLength(2)
-        expect(requests[0]).toContain("turn-1")
-        expect(requests[1]).not.toContain("turn-1")
-        for (const turn of [2, 3, 4]) expect(requests[1]).toContain(`turn-${turn}`)
-        expect(summaries).toHaveLength(1)
-        const summary = summaries[0]
-        expect(summary.info.role === "assistant" && summary.info.error).toBeUndefined()
-        expect(summary.parts.some((part) => part.type === "text" && part.text === "summary")).toBe(true)
+        expect(requests).toHaveLength(4)
+        for (let i = 1; i < requests.length; i++) expect(requests[i].length).toBeLessThan(requests[i - 1].length)
+        expect(requests[1]).toContain("characters omitted")
+        expect(requests[3]).toContain("turn-1 ")
+        expect(requests[3]).toContain("turn-6 ")
+        expect(requests[3]).not.toContain("turn-2 ")
+        expect(requests[3]).toMatch(/\[\d+ older exchanges? omitted\]/)
+        expect(summary?.info.role === "assistant" && summary.info.error).toBeUndefined()
+        expect(summary?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+          headed("summary"),
+        ])
+        expect(errors.count).toBe(0)
       }).pipe(withCompaction({ llm: stub.llmLayer }))
     },
     { git: true },
   )
 
   itCompaction.instance(
-    "stops after three shorter summary requests the model refuses as too long",
+    "stops with one error once every shorter summary request is refused as too long",
     () => {
       const stub = llm()
       const requests: string[] = []
-      for (let i = 0; i < 5; i++) stub.push(tooLong((input) => requests.push(JSON.stringify(input.messages))))
+      for (let i = 0; i < 6; i++) stub.push(tooLong((input) => requests.push(textOf(input))))
       return Effect.gen(function* () {
         const ssn = yield* SessionNs.Service
         const session = yield* ssn.create({})
-        yield* createTurns(session.id, 4)
+        const errors = yield* countErrors(session.id)
+        yield* createTurns(session.id, 8, 4_000)
         yield* createSummaryCompaction(session.id)
 
         const msgs = yield* ssn.messages({ sessionID: session.id })
@@ -1031,21 +1173,342 @@ describe("session.compaction.process", () => {
           sessionID: session.id,
           auto: false,
         })
-        const summaries = (yield* ssn.messages({ sessionID: session.id })).filter(
-          (msg) => msg.info.role === "assistant" && msg.info.summary,
-        )
+        const summary = (yield* summaryOf(session.id))?.info
 
         expect(result).toBe("stop")
-        expect(requests).toHaveLength(4)
-        expect(requests[3]).toContain("turn-4")
-        for (const turn of [1, 2, 3]) expect(requests[3]).not.toContain(`turn-${turn}`)
-        expect(summaries).toHaveLength(1)
-        const summary = summaries[0].info
-        expect(summary.role === "assistant" && summary.finish).toBe("error")
-        expect(summary.role === "assistant" && summary.error?.name).toBe("ContextOverflowError")
+        expect(requests).toHaveLength(5)
+        expect(requests[4]).toContain("turn-8 ")
+        expect(summary?.role === "assistant" && summary.finish).toBe("error")
+        expect(summary?.role === "assistant" && summary.error?.name).toBe("ContextOverflowError")
+        expect(errors.count).toBe(1)
       }).pipe(withCompaction({ llm: stub.llmLayer }))
     },
     { git: true },
+  )
+
+  itCompaction.instance(
+    "clears a refused attempt's partial reply before sending a shorter one",
+    () => {
+      const stub = llm()
+      stub.push(partialThenTooLong())
+      stub.push(reply(headed("summary")))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createTurns(session.id, 4, 4_000)
+        yield* createSummaryCompaction(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const result = yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+        const summary = yield* summaryOf(session.id)
+
+        expect(result).toBe("continue")
+        expect(summary?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+          headed("summary"),
+        ])
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "reminds the model of the template once and keeps its first summary when that does not help",
+    () => {
+      const stub = llm()
+      const requests: string[] = []
+      const capture = (input: LLM.StreamInput) => requests.push(textOf(input))
+      stub.push(reply("plain summary", capture))
+      stub.push(reply("still plain", capture))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createTurns(session.id, 2)
+        yield* createSummaryCompaction(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+        const summary = yield* summaryOf(session.id)
+
+        expect(requests).toHaveLength(2)
+        expect(requests[0]).not.toContain("did not fill in the required summary template")
+        expect(requests[1]).toContain("did not fill in the required summary template")
+        expect(summary?.info.role === "assistant" && summary.info.finish).toBe("stop")
+        expect(summary?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+          "plain summary",
+        ])
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "keeps the reminded summary when it fills the template",
+    () => {
+      const stub = llm()
+      stub.push(reply("plain summary"))
+      stub.push(reply(headed("fixed summary")))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createTurns(session.id, 2)
+        yield* createSummaryCompaction(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+        const summary = yield* summaryOf(session.id)
+
+        expect(summary?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+          headed("fixed summary"),
+        ])
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "does not remind the model of the template when a plugin replaces the compaction prompt",
+    () => {
+      const stub = llm()
+      const requests: string[] = []
+      stub.push(reply("plain summary", (input) => requests.push(textOf(input))))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createTurns(session.id, 2)
+        yield* createSummaryCompaction(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(requests).toHaveLength(1)
+        expect(requests[0]).toContain("Summarize in one line.")
+      }).pipe(withCompaction({ llm: stub.llmLayer, plugin: compactionPrompt("Summarize in one line.") }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "summarizes with the conversation's own request, appending the prompt and keeping tools from running",
+    () => {
+      const stub = llm()
+      const requests: LLM.StreamInput[] = []
+      const calls: Array<Parameters<SessionCompaction.Live>[0]> = []
+      stub.push(reply(headed("live summary"), (input) => requests.push(input)))
+      return Effect.gen(function* () {
+        const test = yield* TestInstance
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const errors = yield* countErrors(session.id)
+        yield* createMeasuredTurn(session.id, test.directory, 50_000)
+        yield* createSummaryCompaction(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const result = yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: true,
+          live: liveRequest(calls),
+        })
+        const summary = yield* summaryOf(session.id)
+
+        expect(result).toBe("continue")
+        expect(calls).toHaveLength(1)
+        expect(calls[0].messages.map((msg) => msg.info.id)).toEqual(msgs.slice(0, -1).map((msg) => msg.info.id))
+        expect(requests).toHaveLength(1)
+        expect(requests[0].system).toEqual(["live system"])
+        expect(JSON.stringify(requests[0].messages[0])).toContain("live prefix")
+        const prompt = JSON.stringify(requests[0].messages.at(-1))
+        expect(prompt).toContain("CRITICAL: Respond with TEXT ONLY")
+        expect(prompt).toContain("You MUST summarize the conversation above")
+        expect(requests[0].tools.probe?.execute).toBeUndefined()
+        expect(requests[0].maxOutputTokens).toBeGreaterThan(0)
+        expect(requests[0].maxOutputTokens!).toBeLessThanOrEqual(100_000 - 50_010)
+        expect(summary?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+          headed("live summary"),
+        ])
+        expect(errors.count).toBe(0)
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "falls back to the text transcript when the live summary is unusable",
+    () => {
+      const stub = llm()
+      const requests: string[] = []
+      const capture = (input: LLM.StreamInput) => requests.push(textOf(input))
+      const plain = (capture: (input: LLM.StreamInput) => void) => reply("plain", capture)
+      const cases = [[toolCall], [empty], [tooLong], [plain, plain]]
+      for (const attempts of cases) {
+        for (const attempt of attempts) stub.push(attempt(capture))
+        stub.push(reply(headed("text summary"), capture))
+      }
+      return Effect.gen(function* () {
+        const test = yield* TestInstance
+        const ssn = yield* SessionNs.Service
+        for (const attempts of cases) {
+          requests.length = 0
+          const session = yield* ssn.create({})
+          const errors = yield* countErrors(session.id)
+          yield* createMeasuredTurn(session.id, test.directory, 1_000)
+          yield* createSummaryCompaction(session.id)
+
+          const msgs = yield* ssn.messages({ sessionID: session.id })
+          const result = yield* SessionCompaction.use.process({
+            parentID: msgs.at(-1)!.info.id,
+            messages: msgs,
+            sessionID: session.id,
+            auto: false,
+            live: liveRequest([]),
+          })
+          const summary = yield* summaryOf(session.id)
+
+          expect(result).toBe("continue")
+          expect(requests).toHaveLength(attempts.length + 1)
+          for (const live of requests.slice(0, -1)) expect(live).toContain("live prefix")
+          if (attempts.length === 2) expect(requests[1]).toContain("did not fill in the required summary template")
+          expect(requests.at(-1)).toContain("<conversation>")
+          expect(requests.at(-1)).not.toContain("live prefix")
+          expect(summary?.parts.some((part) => part.type === "tool")).toBe(false)
+          expect(summary?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+            headed("text summary"),
+          ])
+          expect(errors.count).toBe(0)
+        }
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "skips the live request when it cannot reuse the conversation's request",
+    () => {
+      const stub = llm()
+      const requests: string[] = []
+      const cases = [
+        { input: 99_000 },
+        { input: 1_000, variant: "high" },
+        {
+          input: 1_000,
+          format: new SessionV1.OutputFormatJsonSchema({ type: "json_schema", schema: { type: "object" }, retryCount: 2 }),
+        },
+        { input: 1_000, overflow: true },
+      ]
+      for (const _ of cases) stub.push(reply(headed("text summary"), (input) => requests.push(textOf(input))))
+      return Effect.gen(function* () {
+        const test = yield* TestInstance
+        const ssn = yield* SessionNs.Service
+        for (const item of cases) {
+          requests.length = 0
+          const calls: Array<Parameters<SessionCompaction.Live>[0]> = []
+          const session = yield* ssn.create({})
+          yield* createUserMessage(session.id, "earlier turn")
+          yield* createMeasuredTurn(session.id, test.directory, item.input, item)
+          yield* createSummaryCompaction(session.id)
+
+          const msgs = yield* ssn.messages({ sessionID: session.id })
+          yield* SessionCompaction.use.process({
+            parentID: msgs.at(-1)!.info.id,
+            messages: msgs,
+            sessionID: session.id,
+            auto: false,
+            overflow: item.overflow,
+            live: liveRequest(calls),
+          })
+
+          expect(calls).toEqual([])
+          expect(requests).toHaveLength(1)
+          expect(requests[0]).toContain("<conversation>")
+        }
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "ignores the model's reasoning when sizing the retained tail",
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const ssn = yield* SessionNs.Service
+      const session = yield* ssn.create({})
+      yield* createUserMessage(session.id, "older turn")
+      const recent = yield* createUserMessage(session.id, "recent turn")
+      const answer = yield* createAssistantMessage(session.id, recent.id, test.directory)
+      yield* ssn.updatePart({
+        id: PartID.ascending(),
+        messageID: answer.id,
+        sessionID: session.id,
+        type: "reasoning",
+        text: "r".repeat(40_000),
+        time: { start: Date.now(), end: Date.now() },
+      })
+      yield* ssn.updatePart({
+        id: PartID.ascending(),
+        messageID: answer.id,
+        sessionID: session.id,
+        type: "text",
+        text: "recent reply",
+      })
+      yield* createSummaryCompaction(session.id)
+
+      const msgs = yield* ssn.messages({ sessionID: session.id })
+      yield* SessionCompaction.use.process({
+        parentID: msgs.at(-1)!.info.id,
+        messages: msgs,
+        sessionID: session.id,
+        auto: false,
+      })
+
+      expect((yield* readCompactionPart(session.id))?.tail_start_id).toBe(recent.id)
+    }).pipe(withCompaction({ config: cfg({ tail_turns: 1, preserve_recent_tokens: 2_000 }) })),
+  )
+
+  itCompaction.instance(
+    "sizes the retained tail for the session's model rather than the compaction agent's",
+    Effect.gen(function* () {
+      const ssn = yield* SessionNs.Service
+      const session = yield* ssn.create({})
+      yield* createUserMessage(session.id, "older turn")
+      const recent = yield* createUserMessage(session.id, "y".repeat(16_000))
+      yield* createSummaryCompaction(session.id)
+
+      const msgs = yield* ssn.messages({ sessionID: session.id })
+      yield* SessionCompaction.use.process({
+        parentID: msgs.at(-1)!.info.id,
+        messages: msgs,
+        sessionID: session.id,
+        auto: false,
+      })
+
+      expect((yield* readCompactionPart(session.id))?.tail_start_id).toBe(recent.id)
+    }).pipe(
+      withCompaction({
+        provider: small(),
+        config: cfg({ tail_turns: 1 }, { compaction: { model: "test/small-model" } }),
+      }),
+    ),
   )
 
   it.instance(
@@ -1501,16 +1964,26 @@ describe("session.compaction.process", () => {
       return Effect.gen(function* () {
         const ssn = yield* SessionNs.Service
         const session = yield* ssn.create({})
+        const errors = yield* countErrors(session.id)
         const msg = yield* createUserMessage(session.id, "hello")
         const msgs = yield* ssn.messages({ sessionID: session.id })
-        yield* SessionCompaction.use.process({ parentID: msg.id, messages: msgs, sessionID: session.id, auto: false })
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
 
         const summary = (yield* ssn.messages({ sessionID: session.id })).find(
           (item) => item.info.role === "assistant" && item.info.summary,
         )
 
+        expect(result).toBe("stop")
         expect(summary?.info.role).toBe("assistant")
+        expect(summary?.info.role === "assistant" && summary.info.finish).toBe("error")
+        expect(JSON.stringify(summary?.info.role === "assistant" && summary.info.error)).toContain("called a tool")
         expect(summary?.parts.some((part) => part.type === "tool")).toBe(false)
+        expect(errors.count).toBe(1)
       }).pipe(withCompaction({ llm: stub.llmLayer }))
     },
     { git: true },
@@ -1571,9 +2044,9 @@ describe("session.compaction.process", () => {
     () => {
       const stub = llm()
       let captured = ""
-      stub.push(reply("summary one"))
+      stub.push(reply(headed("summary one")))
       stub.push(
-        reply("summary two", (input) => {
+        reply(headed("summary two"), (input) => {
           captured = JSON.stringify(input.messages)
         }),
       )
@@ -1723,8 +2196,8 @@ describe("session.compaction.process", () => {
 
   itCompaction.instance("keeps recent pre-compaction turns across repeated compactions", () => {
     const stub = llm()
-    stub.push(reply("summary one"))
-    stub.push(reply("summary two"))
+    stub.push(reply(headed("summary one")))
+    stub.push(reply(headed("summary two")))
 
     return Effect.gen(function* () {
       const ssn = yield* SessionNs.Service

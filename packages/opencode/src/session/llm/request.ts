@@ -27,6 +27,7 @@ type PrepareInput = {
   readonly messages: ModelMessage[]
   readonly small?: boolean
   readonly tools: Record<string, Tool>
+  readonly maxOutputTokens?: number
   readonly provider: Provider.Info
   readonly auth: Auth.Info | undefined
   readonly plugin: Plugin.Interface
@@ -129,6 +130,15 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
       options,
     },
   )
+  if (input.maxOutputTokens !== undefined) {
+    // A fixed thinking budget is sent on top of the output limit (`max_tokens = maxOutputTokens + budgetTokens`),
+    // so the limit gives up that much, but never all of it: `max_tokens` must stay above the budget.
+    const budget = params.options.thinking?.type === "enabled" ? (params.options.thinking.budgetTokens ?? 1024) : 0
+    params.maxOutputTokens = Math.max(
+      1,
+      Math.min(params.maxOutputTokens ?? Number.POSITIVE_INFINITY, input.maxOutputTokens - budget),
+    )
+  }
 
   const { headers } = yield* input.plugin.trigger(
     "chat.headers",

@@ -1169,3 +1169,101 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
     { config: cfg },
   ),
 )
+
+itProviderError.live("session.processor effect tests end a summary at its first tool call without a tool part", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "summarize")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        msg.summary = true
+        msg.finish = undefined
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const errors: string[] = []
+        const off = yield* events.listen((event) => {
+          if (event.type === Session.Event.Error.type) errors.push(event.type)
+          return Effect.void
+        })
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "summarize" }],
+          tools: {},
+        })
+        yield* off
+
+        const parts = yield* MessageV2.parts(msg.id)
+        expect(result).toBe("continue")
+        expect(handle.message.finish).toBe("tool-calls")
+        expect(handle.message.error).toBeUndefined()
+        expect(parts.some((part) => part.type === "tool")).toBe(false)
+        expect(errors).toEqual([])
+      }),
+    { config: cfg },
+  ),
+)
+
+itFragmentFailure.live("session.processor effect tests leave a failed summary's error to compaction", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const sts = yield* SessionStatus.Service
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "summarize")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        msg.summary = true
+        msg.finish = undefined
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const errors: string[] = []
+        const off = yield* events.listen((event) => {
+          if (event.type === Session.Event.Error.type) errors.push(event.type)
+          return Effect.void
+        })
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "summarize" }],
+          tools: {},
+        })
+        const state = yield* sts.get(chat.id)
+        yield* off
+
+        expect(result).toBe("stop")
+        expect(handle.message.error?.name).toBe("UnknownError")
+        expect(errors).toEqual([])
+        expect(state).toMatchObject({ type: "busy" })
+      }),
+    { config: cfg },
+  ),
+)

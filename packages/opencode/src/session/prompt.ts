@@ -1078,6 +1078,87 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
+    /** The model request for a turn on `messages`; compaction appends its summary prompt to the same request. */
+    const assemble = Effect.fn("SessionPrompt.assemble")(function* (input: {
+      session: Session.Info
+      agent: Agent.Info
+      user: SessionV1.User
+      model: Provider.Model
+      messages: SessionV1.WithParts[]
+      processor: SessionProcessor.Handle
+      prompt?: SessionV1.WithParts
+      onStructured?: (output: unknown) => void
+    }) {
+      const msgs = yield* SessionReminders.apply({
+        messages: input.messages,
+        agent: input.agent,
+        session: input.session,
+      }).pipe(
+        Effect.provideService(RuntimeFlags.Service, flags),
+        Effect.provideService(FSUtil.Service, fsys),
+        Effect.provideService(Session.Service, sessions),
+      )
+      const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
+      const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
+      const promptOps = yield* ops()
+
+      const tools = yield* SessionTools.resolve({
+        agent: input.agent,
+        session: input.session,
+        model: input.model,
+        processor: input.processor,
+        bypassAgentCheck,
+        messages: msgs,
+        promptOps,
+      }).pipe(
+        Effect.provideService(Plugin.Service, plugin),
+        Effect.provideService(Permission.Service, permission),
+        Effect.provideService(ToolRegistry.Service, registry),
+        Effect.provideService(MCP.Service, mcp),
+        Effect.provideService(Truncate.Service, truncate),
+        Effect.provideService(RuntimeFlags.Service, flags),
+      )
+
+      const format = input.user.format ?? { type: "text" as const }
+      if (format.type === "json_schema") {
+        tools["StructuredOutput"] = createStructuredOutputTool({
+          schema: format.schema,
+          onSuccess(output) {
+            input.onStructured?.(output)
+          },
+        })
+      }
+
+      if (input.prompt) msgs.push(input.prompt)
+      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+
+      const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
+        sys.skills(input.agent),
+        sys.environment(input.model),
+        instruction.system().pipe(Effect.orDie),
+        sys.mcp(input.agent, input.session.permission),
+        MessageV2.toModelMessagesEffect(msgs, input.model),
+      ])
+      const system = [
+        ...env,
+        ...instructions,
+        ...(mcpInstructions ? [mcpInstructions] : []),
+        ...(skills ? [skills] : []),
+      ]
+      if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+      return {
+        user: input.user,
+        agent: input.agent,
+        permission: input.session.permission,
+        sessionID: input.session.id,
+        parentSessionID: input.session.parentID,
+        system,
+        messages: modelMsgs,
+        tools,
+        model: input.model,
+      } satisfies LLM.StreamInput
+    })
+
     const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
@@ -1089,7 +1170,7 @@ const layer = Layer.effect(
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+          const msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
             Effect.provideService(Database.Service, database),
           )
 
@@ -1153,6 +1234,12 @@ const layer = Layer.effect(
               sessionID,
               auto: task.auto,
               overflow: task.overflow,
+              live: (input) =>
+                Effect.gen(function* () {
+                  const agent = yield* agents.get(input.user.agent)
+                  if (!agent) return undefined
+                  return yield* assemble({ ...input, session, agent })
+                }),
             })
             if (result === "stop") break
             continue
@@ -1177,11 +1264,6 @@ const layer = Layer.effect(
           }
           const maxSteps = agent.steps ?? Infinity
           const isLastStep = step >= maxSteps
-          msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
-            Effect.provideService(RuntimeFlags.Service, flags),
-            Effect.provideService(FSUtil.Service, fsys),
-            Effect.provideService(Session.Service, sessions),
-          )
 
           const msg: SessionV1.Assistant = {
             id: MessageID.ascending(),
@@ -1219,69 +1301,27 @@ const layer = Layer.effect(
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
-            const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
-            const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
-            const promptOps = yield* ops()
-
-            const tools = yield* SessionTools.resolve({
-              agent,
-              session,
-              model,
-              processor: handle,
-              bypassAgentCheck,
-              messages: msgs,
-              promptOps,
-            }).pipe(
-              Effect.provideService(Plugin.Service, plugin),
-              Effect.provideService(Permission.Service, permission),
-              Effect.provideService(ToolRegistry.Service, registry),
-              Effect.provideService(MCP.Service, mcp),
-              Effect.provideService(Truncate.Service, truncate),
-              Effect.provideService(RuntimeFlags.Service, flags),
-            )
-
-            if (lastUser.format?.type === "json_schema") {
-              tools["StructuredOutput"] = createStructuredOutputTool({
-                schema: lastUser.format.schema,
-                onSuccess(output) {
-                  structured = output
-                },
-              })
-            }
-
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-
-            const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
-              sys.skills(agent),
-              sys.environment(model),
-              instruction.system().pipe(Effect.orDie),
-              sys.mcp(agent, session.permission),
-              MessageV2.toModelMessagesEffect(msgs, model),
-            ])
-            const system = [
-              ...env,
-              ...instructions,
-              ...(mcpInstructions ? [mcpInstructions] : []),
-              ...(skills ? [skills] : []),
-            ]
-            const format = lastUser.format ?? { type: "text" as const }
-            if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
-            const result = yield* handle.process({
-              user: lastUser,
+            const request = yield* assemble({
+              session,
               agent,
-              permission: session.permission,
-              sessionID,
-              parentSessionID: session.parentID,
-              system,
+              user: lastUser,
+              model,
+              messages: msgs,
+              processor: handle,
+              onStructured(output) {
+                structured = output
+              },
+            })
+            const format = lastUser.format ?? { type: "text" as const }
+            const result = yield* handle.process({
+              ...request,
               messages: [
-                ...modelMsgs,
+                ...request.messages,
                 ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
               ],
-              tools,
-              model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             })
 

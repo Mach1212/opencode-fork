@@ -42,6 +42,8 @@ export type StreamInput = {
   messages: ModelMessage[]
   small?: boolean
   tools: Record<string, Tool>
+  /** Lowers the output limit to at most this, thinking budget included. */
+  maxOutputTokens?: number
   retries?: number
   toolChoice?: "auto" | "required" | "none"
 }

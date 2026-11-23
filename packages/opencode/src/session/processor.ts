@@ -113,6 +113,8 @@ const layer = Layer.effect(
         reasoningMap: {},
       }
       let aborted = false
+      // A summary that calls a tool is cut off there and left to the caller, which can ask again.
+      let summaryToolCall = false
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -276,6 +278,17 @@ const layer = Layer.effect(
       }
 
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
+        if (
+          ctx.assistantMessage.summary &&
+          (value.type === "tool-input-start" ||
+            value.type === "tool-input-delta" ||
+            value.type === "tool-input-end" ||
+            value.type === "tool-call")
+        ) {
+          summaryToolCall = true
+          ctx.assistantMessage.finish = "tool-calls"
+          return
+        }
         switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
@@ -313,9 +326,6 @@ const layer = Layer.effect(
             return
 
           case "tool-input-start":
-            if (ctx.assistantMessage.summary) {
-              throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
-            }
             yield* ensureToolCall(value)
             return
 
@@ -329,9 +339,6 @@ const layer = Layer.effect(
           }
 
           case "tool-call": {
-            if (ctx.assistantMessage.summary) {
-              throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
-            }
             yield* ensureToolCall(value)
             const input = isRecord(value.input) ? value.input : { value: value.input }
             yield* updateToolCall(value.id, (match) => ({
@@ -618,6 +625,12 @@ const layer = Layer.effect(
           stack: e instanceof Error ? e.stack : undefined,
         })
         const error = parse(e)
+        // A failed summary attempt is retried or recorded by compaction, which reports the outcome once.
+        if (ctx.assistantMessage.summary && !aborted) {
+          if (SessionV1.ContextOverflowError.isInstance(error)) ctx.needsCompaction = true
+          else ctx.assistantMessage.error = error
+          return
+        }
         if (SessionV1.ContextOverflowError.isInstance(error)) {
           if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
             ctx.assistantMessage.error = error
@@ -644,6 +657,7 @@ const layer = Layer.effect(
           messageID: input.assistantMessage.id,
         })
         ctx.needsCompaction = false
+        summaryToolCall = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
         return yield* Effect.gen(function* () {
@@ -655,7 +669,7 @@ const layer = Layer.effect(
 
             yield* stream.pipe(
               Stream.tap((event) => handleEvent(event)),
-              Stream.takeUntil(() => ctx.needsCompaction),
+              Stream.takeUntil(() => ctx.needsCompaction || summaryToolCall),
               Stream.runDrain,
             )
           }).pipe(
