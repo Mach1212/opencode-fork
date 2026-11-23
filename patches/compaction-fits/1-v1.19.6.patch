@@ -1,20 +1,178 @@
 diff --git a/packages/opencode/src/session/compaction.ts b/packages/opencode/src/session/compaction.ts
-index 75d6374..eede84e 100644
+index 75d6374..bb71f40 100644
 --- a/packages/opencode/src/session/compaction.ts
 +++ b/packages/opencode/src/session/compaction.ts
-@@ -31,6 +31,8 @@ const TOOL_OUTPUT_MAX_CHARS = 2_000
+@@ -1,12 +1,17 @@
+ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+ import { SessionV1 } from "@opencode-ai/core/v1/session"
+ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
++import { Database } from "@opencode-ai/core/database/database"
++import { NamedError } from "@opencode-ai/core/util/error"
++import type { ModelMessage } from "ai"
+ import { Session } from "./session"
+ import { SessionID, MessageID, PartID } from "./schema"
+ import { Provider } from "@/provider/provider"
++import { ProviderTransform } from "@/provider/transform"
+ import { MessageV2 } from "./message-v2"
+ import { Token } from "@/util/token"
+ import { SessionProcessor } from "./processor"
++import type { LLM } from "./llm"
+ import { Agent } from "@/agent/agent"
+ import { Plugin } from "@/plugin"
+ import { Config } from "@/config/config"
+@@ -27,63 +32,267 @@ export const Event = SessionCompactionEvent
+ 
+ export const PRUNE_MINIMUM = 20_000
+ export const PRUNE_PROTECT = 40_000
+-const TOOL_OUTPUT_MAX_CHARS = 2_000
  const PRUNE_PROTECTED_TOOLS = ["skill"]
  const MIN_PRESERVE_RECENT_TOKENS = 2_000
  const MAX_PRESERVE_RECENT_TOKENS = 15_000
-+const SUMMARY_RETRIES = 3
-+const HISTORY_CUT = "[The start of the conversation is left out here: all of it was too long to summarize.]"
- type Turn = {
-   start: number
-   end: number
-@@ -63,10 +65,11 @@ const serialize = (message: SessionV1.WithParts) => {
+-type Turn = {
+-  start: number
+-  end: number
+-  id: MessageID
++/** After each "too long" rejection, the next summary request aims at this share of the first rejected one's size. */
++const SHRINK_STEPS = [0.85, 0.7, 0.5, 0.35]
++/** The least of the window kept free for the summary, and the share of the window kept free when that is more. */
++const RESERVE_MIN = 16_000
++const RESERVE_SHARE = 0.15
++/** A common window size, assumed for the summary request when the model's window is unknown. */
++const UNKNOWN_WINDOW = 200_000
++/** A summary gets at least this much output, or the room left if less, even when the estimate margin leaves less. */
++const SUMMARY_OUTPUT_FLOOR = 32_000
++const OUTPUT_TOKEN_MIN = 1_024
++/** Prompt text is estimated at about 4 characters per token, which can run low on dense text such as code. */
++const ESTIMATE_ERROR = 0.15
++/**
++ * How far one exchange of a summary transcript is shortened, in the order the levels apply: whole; tool outputs cut;
++ * tool outputs left out and tool inputs cut; only the user's text, cut; omitted.
++ */
++const OUTPUTS_CLIPPED = 1
++const OUTPUTS_REMOVED = 2
++const USER_ONLY = 3
++const OMITTED = 4
++const TRANSCRIPT_LEVELS = [0, OUTPUTS_CLIPPED, OUTPUTS_REMOVED, USER_ONLY, OMITTED]
++/** Characters kept, from the start and end together, of a cut tool input, tool output, or user message. */
++const TRANSCRIPT_CLIP = 2_000
++
++const SUMMARY_TEMPLATE = `You MUST use this format for your response (you may omit sections that aren't applicable). Do not include the <template> tags in your response.
++<template>
++## Objective
++- [one or two brief sentences describing what the user is trying to accomplish]
++
++## Requirements
++- [constraints, preferences, requirements, and scope boundaries stated by the user, or "(none)"]
++
++## Decisions
++- [decisions already made and why, or "(none)"]
++
++## Work State
++Break the objective into smaller goals and report which are completed, which are being worked on, and which are blocked.
++### Completed
++- [goals that have been completed; otherwise "(none)"]
++
++### Active
++- [goals currently being worked on; otherwise "(none)"]
++
++### Blocked
++- [anything blocking progress, and why; otherwise "(none)"]
++
++## Next Move
++1. [ordered list of next actions, or "(none)"]
++
++## Relevant Files
++List the files and directories, other than the current working directory, that another agent would need to open to continue this work. Include at most 15, most important first. Do not list every file that was read or changed. Include paths outside the current working directory when relevant. If none, write "(none)".
++- \`[file or directory path]\`: [brief reason it matters]
++
++## Important Context
++- [facts the next agent cannot continue without and cannot easily find on its own; or "(none)"]
++</template>`
++
++const SUMMARY_RULES = `Rules:
++- Keep each section concise. Use terse, single-line bullets, not prose paragraphs or nested lists.
++- Prefer short references over detailed restatement. It is fine to leave out information the next agent can recover from the code or the files listed above.
++- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers.
++- Carry forward only user questions or requests that remain unanswered or require further action. Do not repeat ones that newer history has answered or resolved. Preserve exact wording when carrying one forward.
++- Preserve consequential workflow state, including whether changes are uncommitted, committed, pushed, under review, or merged.
++- Do not mention the summary process or that context was compacted.`
++
++const livePrompt = (update: boolean) => {
++  const shared = [
++    "Summarize only what the user and the assistant said and did. Leave out instructions and setup the assistant was given rather than told by the user: repository conventions, instruction files such as AGENTS.md, and environment details like the session ID. The next agent receives current versions of all of these separately.",
++    SUMMARY_TEMPLATE,
++    SUMMARY_RULES,
++    "Do not continue the task or call tools.",
++    "Return only the structured summary in the requested format. Do not include a preamble, explanation, or other commentary.",
++  ]
++  if (!update) {
++    return [
++      "You MUST summarize the conversation above into a structured summary that will be given to another agent to resume the work.",
++      ...shared,
++    ].join("\n\n")
++  }
++  return [
++    "Update the existing checkpoint in the conversation above into one consolidated summary.",
++    "Newer history always takes precedence over the existing checkpoint. Preserve previous information unless newer history clearly contradicts, supersedes, resolves, or makes it stale. If something is no longer relevant to continuing the work, you may remove it.",
++    "Incorporate newer requirements, decisions, progress, and context. Reconcile Work State and Next Move: move completed work out of Active, remove resolved blockers and answered questions, and preserve unresolved or pending work.",
++    ...shared,
++  ].join("\n\n")
+ }
+ 
+-type Tail = {
+-  start: number
+-  id: MessageID
+-}
++const TEXT_ONLY = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."
++const NUDGE =
++  "The previous response did not fill in the required summary template. Do not call tools. Return the summary as text using the exact section headings from the template."
+ 
+-type CompletedCompaction = {
+-  userIndex: number
+-  assistantIndex: number
+-  summary: string | undefined
++const headings = (template: string) => template.split("\n").filter((line) => line.startsWith("##"))
++const LIVE_HEADINGS = headings(SUMMARY_TEMPLATE)
++const TEXT_HEADINGS = headings(buildPrompt({ context: [] }))
++const filled = (text: string, expected: string[]) => text.split("\n").some((line) => expected.includes(line.trim()))
++
++const withNudge = (messages: ModelMessage[]): ModelMessage[] => {
++  const last = messages.at(-1)
++  if (last?.role !== "user") return [...messages, { role: "user", content: NUDGE }]
++  const content = typeof last.content === "string" ? [{ type: "text" as const, text: last.content }] : last.content
++  return [...messages.slice(0, -1), { ...last, content: [...content, { type: "text", text: NUDGE }] }]
+ }
+ 
+-const truncate = (value: string) =>
+-  value.length <= TOOL_OUTPUT_MAX_CHARS ? value : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`
++/** `value` cut to `TRANSCRIPT_CLIP` characters from its start and end, never splitting a surrogate pair. */
++const clip = (value: string) => {
++  if (value.length <= TRANSCRIPT_CLIP) return value
++  const chars = Array.from(value)
++  if (chars.length <= TRANSCRIPT_CLIP) return value
++  const half = TRANSCRIPT_CLIP / 2
++  return `${chars.slice(0, half).join("")}\n[... ${chars.length - TRANSCRIPT_CLIP} characters omitted ...]\n${chars.slice(-half).join("")}`
++}
+ 
+-const serialize = (message: SessionV1.WithParts) => {
++/** One stored message as transcript lines at a shortening level; empty for what that level leaves out. */
++const render = (message: SessionV1.WithParts, level: number) => {
++  if (level === OMITTED) return ""
+   if (message.info.role === "user") {
+     const text = message.parts
+       .filter((part): part is SessionV1.TextPart => part.type === "text" && !part.ignored)
+       .map((part) => part.text)
+       .filter(Boolean)
+       .join("\n")
++    const said = text ? [`[User]: ${level >= USER_ONLY ? clip(text) : text}`] : []
++    if (level >= USER_ONLY) return said.join("\n")
+     const files = message.parts.flatMap((part) =>
+       part.type === "file" ? [`[Attached ${part.mime}: ${part.filename ?? "file"}]`] : [],
      )
-     return [...(text ? [`[User]: ${text}`] : []), ...files].join("\n")
+-    return [...(text ? [`[User]: ${text}`] : []), ...files].join("\n")
++    return [...said, ...files].join("\n")
    }
++  if (level >= USER_ONLY) return ""
 +  // The model's reasoning stays out: the provider drops it from the conversation's own requests,
 +  // so it would make the summary request larger than the context it summarizes.
    return message.parts
@@ -22,27 +180,225 @@ index 75d6374..eede84e 100644
        if (part.type === "text") return part.text ? [`[Assistant]: ${part.text}`] : []
 -      if (part.type === "reasoning") return part.text ? [`[Assistant reasoning]: ${part.text}`] : []
        if (part.type !== "tool") return []
-       const call = `[Assistant tool call]: ${part.tool}(${JSON.stringify(part.state.input)})`
+-      const call = `[Assistant tool call]: ${part.tool}(${JSON.stringify(part.state.input)})`
++      const input = JSON.stringify(part.state.input) ?? ""
++      const call = `[Assistant tool call]: ${part.tool}(${level >= OUTPUTS_REMOVED ? clip(input) : input})`
        if (part.state.status === "completed") {
-@@ -84,6 +87,14 @@ const serialize = (message: SessionV1.WithParts) => {
++        if (level >= OUTPUTS_REMOVED) return [call, "[Tool result omitted]"]
+         const attachments = (part.state.attachments ?? []).map(
+           (item) => `[Attached ${item.mime}: ${item.filename ?? "file"}]`,
+         )
+         const output = part.state.time.compacted
+           ? "[Old tool result content cleared]"
+-          : truncate([part.state.output, ...attachments].join("\n"))
+-        return [call, `[Tool result]: ${output}`]
++          : [part.state.output, ...attachments].join("\n")
++        return [call, `[Tool result]: ${level >= OUTPUTS_CLIPPED ? clip(output) : output}`]
++      }
++      if (part.state.status === "error") {
++        if (level >= OUTPUTS_REMOVED) return [call, "[Tool error omitted]"]
++        return [call, `[Tool error]: ${level >= OUTPUTS_CLIPPED ? clip(part.state.error) : part.state.error}`]
+       }
+-      if (part.state.status === "error") return [call, `[Tool error]: ${part.state.error}`]
+       return [call]
+     })
      .join("\n")
  }
  
-+// At least one entry goes, and at least one stays.
-+function oldestQuarter(entries: string[]) {
-+  const total = entries.reduce((sum, entry) => sum + entry.length, 0)
-+  let count = 0
-+  for (let dropped = 0; count < entries.length - 1 && dropped < total / 4; count++) dropped += entries[count].length
-+  return count
++const exchanges = (messages: SessionV1.WithParts[]) =>
++  messages
++    .reduce<SessionV1.WithParts[][]>((groups, message) => {
++      if (message.info.role === "user" || groups.length === 0) groups.push([message])
++      else groups[groups.length - 1].push(message)
++      return groups
++    }, [])
++    .map((group) =>
++      TRANSCRIPT_LEVELS.map((level) =>
++        group
++          .map((message) => render(message, level))
++          .filter(Boolean)
++          .join("\n"),
++      ),
++    )
++    .filter((renders) => renders[0])
++
++const note = (omitted: number) =>
++  omitted ? `[${omitted} older ${omitted === 1 ? "exchange" : "exchanges"} omitted]` : ""
++const size = (text: string) => (text ? Token.estimate(text) + 1 : 0)
++
++/**
++ * The transcript within `room` tokens. Exchanges are shortened oldest first, one level at a time, so detail goes from
++ * the oldest history first and whole exchanges only as a last resort; the newest is never omitted. `keepFirst` holds
++ * the opening exchange, which states the task, at its shortest until every other exchange that can go has gone.
++ * Undefined when the transcript cannot fit even so.
++ */
++const fit = (renders: string[][], room: number, keepFirst: boolean) => {
++  // Room for the longest possible note is set aside before choosing what to keep.
++  const budget = room - Token.estimate(note(renders.length))
++  const levels = renders.map(() => 0)
++  let total = renders.reduce((sum, item) => sum + size(item[0]), 0)
++  const newest = renders.length - 1
++  for (const level of TRANSCRIPT_LEVELS.slice(1)) {
++    for (let index = 0; index < renders.length && total > budget; index++) {
++      if (index === newest && !renders[index][level]) continue
++      if (keepFirst && index === 0 && level === OMITTED) continue
++      total += size(renders[index][level]) - size(renders[index][levels[index]])
++      levels[index] = level
++    }
++  }
++  if (total > budget && keepFirst && newest > 0) {
++    total -= size(renders[0][levels[0]])
++    levels[0] = OMITTED
++  }
++  if (total > budget) return undefined
++  const kept = renders.map((item, index) => item[levels[index]])
++  const first = kept.findIndex((text) => !text)
++  if (first < 0) return kept.join("\n\n")
++  return [...kept.slice(0, first), note(kept.filter((text) => !text).length), ...kept.slice(first)]
++    .filter(Boolean)
++    .join("\n\n")
++}
++
++/**
++ * The largest prompt the model takes, or 0 when unknown. The context window also holds the reply, so an input limit
++ * above it cannot be used in full.
++ */
++const inputWindow = (limit: Provider.Model["limit"]) =>
++  limit.input && limit.context ? Math.min(limit.input, limit.context) : limit.input || limit.context
++
++/** The largest summary request that still leaves the window's reserve for the summary. */
++const ceiling = (window: number) =>
++  window - Math.max(Math.floor(window * RESERVE_SHARE), window >= 2 * RESERVE_MIN ? RESERVE_MIN : 0)
++
++/** The largest unchanged request that leaves `RESERVE_MIN` for the summary, or less when it cannot generate that much. */
++const summaryRoom = (limit: Provider.Model["limit"], output: number) =>
++  Math.max(0, inputWindow(limit) - Math.min(RESERVE_MIN, output))
++
++/**
++ * The output limit for a summary request of `input` tokens: the room it leaves in the window, with the margin primary
++ * requests keep for a low estimate, but at least `SUMMARY_OUTPUT_FLOOR` of the room left without that margin.
++ */
++const fitOutput = (
++  model: Provider.Model,
++  outputTokenMax: number | undefined,
++  input: { measured: number; estimated: number },
++) => {
++  const requested = ProviderTransform.maxOutputTokens(model, outputTokenMax)
++  if (model.limit.context <= 0) return requested
++  const room = (margin: number) =>
++    Math.max(OUTPUT_TOKEN_MIN, model.limit.context - input.measured - Math.ceil(input.estimated * (1 + margin)))
++  return Math.min(requested, Math.max(room(ESTIMATE_ERROR), Math.min(SUMMARY_OUTPUT_FLOOR, room(0))))
++}
++
++type Turn = {
++  start: number
++  end: number
++  id: MessageID
++}
++
++type Tail = {
++  start: number
++  id: MessageID
++}
++
++type CompletedCompaction = {
++  userIndex: number
++  assistantIndex: number
++  summary: string | undefined
 +}
 +
  function summaryText(message: SessionV1.WithParts) {
    const text = message.parts
      .filter((part): part is SessionV1.TextPart => part.type === "text")
-@@ -377,18 +388,7 @@ const layer = Layer.effect(
+@@ -162,6 +371,18 @@ function splitTurn(input: {
+   })
+ }
+ 
++/**
++ * Builds the request the session's next turn would send for `messages`, with `prompt` appended as its last message.
++ * Undefined when it cannot.
++ */
++export type Live = (input: {
++  messages: SessionV1.WithParts[]
++  user: SessionV1.User
++  model: Provider.Model
++  processor: SessionProcessor.Handle
++  prompt: SessionV1.WithParts
++}) => Effect.Effect<LLM.StreamInput | undefined>
++
+ export interface Interface {
+   readonly isOverflow: (input: {
+     tokens: SessionV1.Assistant["tokens"]
+@@ -174,6 +395,7 @@ export interface Interface {
+     sessionID: SessionID
+     auto: boolean
+     overflow?: boolean
++    live?: Live
+   }) => Effect.Effect<"continue" | "stop">
+   readonly create: (input: {
+     sessionID: SessionID
+@@ -199,6 +421,7 @@ const layer = Layer.effect(
+     const provider = yield* Provider.Service
+     const events = yield* EventV2Bridge.Service
+     const flags = yield* RuntimeFlags.Service
++    const database = yield* Database.Service
+ 
+     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
+       tokens: SessionV1.Assistant["tokens"]
+@@ -216,7 +439,14 @@ const layer = Layer.effect(
+       messages: SessionV1.WithParts[]
+       model: Provider.Model
+     }) {
+-      const msgs = yield* MessageV2.toModelMessagesEffect(input.messages, input.model)
++      // Providers drop old reasoning from the requests they are sent, so it does not count.
++      const msgs = yield* MessageV2.toModelMessagesEffect(
++        input.messages.map((message) => ({
++          ...message,
++          parts: message.parts.filter((part) => part.type !== "reasoning"),
++        })),
++        input.model,
++      )
+       return Token.estimate(JSON.stringify(msgs))
+     })
+ 
+@@ -322,6 +552,7 @@ const layer = Layer.effect(
+       sessionID: SessionID
+       auto: boolean
+       overflow?: boolean
++      live?: Live
+     }) {
+       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
+       if (!parent || parent.info.role !== "user") {
+@@ -356,9 +587,12 @@ const layer = Layer.effect(
+       }
+ 
+       const agent = yield* agents.get("compaction")
++      const sessionModel = yield* provider
++        .getModel(userMessage.model.providerID, userMessage.model.modelID)
++        .pipe(Effect.orDie)
+       const model = agent.model
+         ? yield* provider.getModel(agent.model.providerID, agent.model.modelID).pipe(Effect.orDie)
+-        : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
++        : sessionModel
+       const cfg = yield* config.get()
+       const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
+       const prior = completedCompactions(history)
+@@ -367,7 +601,8 @@ const layer = Layer.effect(
+       const selected = yield* select({
+         messages: history.filter((_, index) => !hidden.has(index)),
+         cfg,
+-        model,
++        // The retained tail is sent to the session's model, so it is sized for that model.
++        model: sessionModel,
+       })
+       // Allow plugins to inject context or replace compaction prompt.
+       const compacting = yield* plugin.trigger(
+@@ -375,20 +610,6 @@ const layer = Layer.effect(
+         { sessionID: input.sessionID },
+         { context: [], prompt: undefined },
        )
-       const msgs = structuredClone(selected.head)
-       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+-      const msgs = structuredClone(selected.head)
+-      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 -      const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
 -      const nextPrompt =
 -        compacting.prompt ??
@@ -55,11 +411,10 @@ index 75d6374..eede84e 100644
 -        ]
 -          .filter(Boolean)
 -          .join("\n\n")
-+      const entries = msgs.map(serialize).filter(Boolean)
        const ctx = yield* InstanceState.context
        const msg: SessionV1.Assistant = {
          id: MessageID.ascending(),
-@@ -422,30 +422,50 @@ const layer = Layer.effect(
+@@ -422,40 +643,204 @@ const layer = Layer.effect(
          sessionID: input.sessionID,
          model,
        })
@@ -82,95 +437,782 @@ index 75d6374..eede84e 100644
 -                  .filter(Boolean)
 -                  .join("\n\n"),
 -              },
--            ],
--          },
++      const parts = () => MessageV2.parts(msg.id).pipe(Effect.provideService(Database.Service, database))
++      const reply = Effect.fnUntraced(function* () {
++        return summaryText({ info: msg, parts: yield* parts() }) ?? ""
++      })
++      // Every attempt writes into the same message, so each starts from no parts, finish, or error.
++      const reset = Effect.fnUntraced(function* () {
++        for (const part of yield* parts()) {
++          yield* session.removePart({ sessionID: msg.sessionID, messageID: msg.id, partID: part.id })
++        }
++        msg.finish = undefined
++        msg.error = undefined
++        msg.time.completed = undefined
++        yield* session.updateMessage(msg)
++      })
++      const usable = (result: SessionProcessor.Result) =>
++        result === "continue" && !msg.error && msg.finish !== "tool-calls"
++      const cap = ceiling(inputWindow(model.limit) || UNKNOWN_WINDOW)
++      const output = (size: { measured: number; estimated: number }) => fitOutput(model, flags.outputTokenMax, size)
++
++      /**
++       * The conversation exactly as the session's next turn would send it, then the summary prompt, so the unchanged
++       * prefix reuses that turn's prompt cache. Only while that request is the one the latest response measured and
++       * still leaves the summary room; false, with the attempt cleared, when it is skipped or its reply is unusable.
++       */
++      const summarizeLive = Effect.fnUntraced(function* () {
++        if (!input.live || input.overflow) return false
++        const user = history.findLast(
++          (item) => item.info.role === "user" && !item.parts.some((part) => part.type === "compaction"),
++        )?.info
++        if (user?.role !== "user" || user.format?.type === "json_schema") return false
++        if (user.model.providerID !== model.providerID || user.model.modelID !== model.id) return false
++        const anchorIndex = history.findLastIndex(
++          (item) => item.info.role === "assistant" && !item.info.summary && item.info.finish !== undefined,
++        )
++        const anchor = history[anchorIndex]
++        if (
++          anchor?.info.role !== "assistant" ||
++          anchor.info.providerID !== model.providerID ||
++          anchor.info.modelID !== model.id ||
++          anchor.info.variant !== user.model.variant
++        )
++          return false
++        const tokens = anchor.info.tokens
++        const prompted = tokens.input + tokens.cache.read + tokens.cache.write
++        if (prompted === 0) return false
++        const prompt = [
++          compacting.prompt ?? livePrompt(previousSummary !== undefined),
++          TEXT_ONLY,
++          ...(compacting.prompt === undefined ? compacting.context : []),
++        ].join("\n\n")
++        // The response measured everything before it, but not its own tool results or anything since.
++        const results = anchor.parts.reduce((sum, part) => {
++          if (part.type !== "tool") return sum
++          if (part.state.status === "completed") return sum + Token.estimate(part.state.output)
++          if (part.state.status === "error") return sum + Token.estimate(part.state.error)
++          return sum
++        }, 0)
++        const size = {
++          measured: prompted + tokens.output + tokens.reasoning,
++          estimated:
++            (yield* estimate({ messages: history.slice(anchorIndex + 1), model })) + results + Token.estimate(prompt),
++        }
++        const room = Math.max(cap, summaryRoom(model.limit, ProviderTransform.maxOutputTokens(model, flags.outputTokenMax)))
++        if (size.measured + size.estimated + Token.estimate(NUDGE) > room) return false
++
++        const id = MessageID.ascending()
++        const request = yield* input.live({
++          messages: structuredClone(history),
++          user,
++          model,
++          processor,
++          prompt: {
++            info: {
++              id,
++              role: "user",
++              sessionID: input.sessionID,
++              agent: user.agent,
++              model: user.model,
++              time: { created: Date.now() },
++            },
++            parts: [
++              { id: PartID.ascending(), messageID: id, sessionID: input.sessionID, type: "text", text: prompt, synthetic: true },
+             ],
+           },
 -        ],
 -        model,
--      })
-+      const summarize = (conversation: string) => {
-+        const nextPrompt =
-+          compacting.prompt ??
-+          [
-+            buildPrompt({
-+              previousSummary,
-+              context: [conversation],
-+            }),
-+            ...compacting.context,
-+          ]
++        })
++        if (!request) return false
++        // The tools stay defined so the prefix still matches, but one the summary calls must not run.
++        const tools = Object.fromEntries(
++          Object.entries(request.tools).map(([name, tool]) => [name, { ...tool, execute: undefined }]),
++        )
++        const send = (messages: ModelMessage[], extra: number) =>
++          processor.process({
++            ...request,
++            tools,
++            messages,
++            maxOutputTokens: output({ measured: size.measured, estimated: size.estimated + extra }),
++          })
++        const result = yield* send(request.messages, 0)
++        const text = yield* reply()
++        if (usable(result) && text) {
++          if (compacting.prompt !== undefined || filled(text, LIVE_HEADINGS)) return true
++          yield* reset()
++          const nudged = yield* send(withNudge(request.messages), Token.estimate(NUDGE))
++          if (usable(nudged) && filled(yield* reply(), LIVE_HEADINGS)) return true
++        }
++        yield* reset()
++        return false
+       })
+ 
+-      if (result === "compact") {
+-        processor.message.error = new SessionV1.ContextOverflowError({
+-          message: replay
+-            ? "Conversation history too large to compact - exceeds model context limit"
+-            : "Session too large to compact - context exceeds model limit even after stripping media",
+-        }).toObject()
+-        processor.message.finish = "error"
+-        yield* session.updateMessage(processor.message)
+-        return "stop"
++      /**
++       * The history before the retained tail as one text transcript, without tools. It is shortened to fit the window,
++       * and again, aiming at `SHRINK_STEPS` of the first rejected request's size, each time the model refuses one as
++       * too long.
++       */
++      const summarizeText = Effect.fnUntraced(function* () {
++        const msgs = structuredClone(selected.head)
++        yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
++        const renders = exchanges(msgs)
++        const promptFor = (conversation: string) => {
++          const nextPrompt =
++            compacting.prompt ??
++            [buildPrompt({ previousSummary, context: [conversation] }), ...compacting.context]
++              .filter(Boolean)
++              .join("\n\n")
++          return [nextPrompt, ...(compacting.prompt ? ["The following is the conversation history:", conversation] : [])]
 +            .filter(Boolean)
 +            .join("\n\n")
-+        return processor.process({
-+          user: userMessage,
-+          agent,
-+          sessionID: input.sessionID,
-+          tools: {},
-+          system: [],
-+          messages: [
-+            {
-+              role: "user",
-+              content: [
-+                {
-+                  type: "text",
-+                  text: [
-+                    nextPrompt,
-+                    ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
-+                  ]
-+                    .filter(Boolean)
-+                    .join("\n\n"),
-+                },
-+              ],
-+            },
-+          ],
-+          model,
++        }
++        const system = Token.estimate(agent.prompt ?? "")
++        const fixed = Token.estimate(promptFor("")) + system + Token.estimate(NUDGE)
++        let rejected: number | undefined
++        for (let rejections = 0; ; ) {
++          const target = rejected === undefined ? cap : Math.floor(rejected * SHRINK_STEPS[rejections - 1])
++          // Until the model refuses one as too long, a transcript that cannot be shortened enough is sent whole.
++          const conversation =
++            fit(renders, target - fixed, previousSummary === undefined) ??
++            (rejected === undefined ? fit(renders, Number.POSITIVE_INFINITY, false) : undefined)
++          if (conversation === undefined) return "overflow" as const
++          const text = promptFor(conversation)
++          const estimated = Token.estimate(text) + system
++          const messages: ModelMessage[] = [{ role: "user", content: [{ type: "text", text }] }]
++          const send = (messages: ModelMessage[], extra: number) =>
++            processor.process({
++              user: userMessage,
++              agent,
++              sessionID: input.sessionID,
++              tools: {},
++              system: [],
++              messages,
++              model,
++              maxOutputTokens: output({ measured: 0, estimated: estimated + extra }),
++            })
++          const result = yield* send(messages, 0)
++          if (result === "compact") {
++            if (rejections === SHRINK_STEPS.length) return "overflow" as const
++            rejected ??= estimated
++            rejections++
++            yield* reset()
++            continue
++          }
++          if (msg.finish === "tool-calls") return "tool-calls" as const
++          if (!usable(result)) return "error" as const
++          const first = yield* reply()
++          if (!first || compacting.prompt !== undefined || filled(first, TEXT_HEADINGS)) return "summarized" as const
++          // One reminder; if it does not help, the first summary is kept rather than none at all.
++          const kept = { parts: yield* parts(), finish: msg.finish, tokens: msg.tokens }
++          yield* reset()
++          const nudged = yield* send(withNudge(messages), Token.estimate(NUDGE))
++          if (usable(nudged) && filled(yield* reply(), TEXT_HEADINGS)) return "summarized" as const
++          yield* reset()
++          for (const part of kept.parts) yield* session.updatePart(part)
++          msg.finish = kept.finish
++          msg.tokens = kept.tokens
++          msg.time.completed = Date.now()
++          yield* session.updateMessage(msg)
++          return "summarized" as const
++        }
++      })
++
++      const outcome = (yield* summarizeLive()) ? ("summarized" as const) : yield* summarizeText()
++      if (outcome !== "summarized") {
++        if (outcome === "overflow") {
++          msg.error = new SessionV1.ContextOverflowError({
++            message: replay
++              ? "Conversation history too large to compact - exceeds model context limit"
++              : "Session too large to compact - context exceeds model limit even after stripping media",
++          }).toObject()
++        }
++        if (outcome === "tool-calls") {
++          msg.error = new NamedError.Unknown({
++            message: "Compaction failed: the model called a tool instead of writing the summary",
++          }).toObject()
++        }
++        if (outcome !== "error") msg.finish = "error"
++        msg.time.completed ??= Date.now()
++        yield* session.updateMessage(msg)
++        if (msg.error) yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: msg.error })
++        return "stop" as const
+       }
+ 
+       if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
+@@ -465,7 +850,7 @@ const layer = Layer.effect(
+         })
+       }
+ 
+-      if (result === "continue" && input.auto) {
++      if (input.auto) {
+         if (replay) {
+           const original = replay.info
+           const replayMsg = yield* session.updateMessage({
+@@ -549,11 +934,8 @@ const layer = Layer.effect(
+         }
+       }
+ 
+-      if (processor.message.error) return "stop"
+-      if (result === "continue") {
+-        yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
+-      }
+-      return result
++      yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
++      return "continue" as const
+     })
+ 
+     const create = Effect.fn("SessionCompaction.create")(function* (input: {
+@@ -602,6 +984,7 @@ export const node = LayerNode.make({
+     Provider.node,
+     EventV2Bridge.node,
+     RuntimeFlags.node,
++    Database.node,
+   ],
+ })
+ 
+diff --git a/packages/opencode/src/session/llm.ts b/packages/opencode/src/session/llm.ts
+index 05e6a41..81eb109 100644
+--- a/packages/opencode/src/session/llm.ts
++++ b/packages/opencode/src/session/llm.ts
+@@ -42,6 +42,8 @@ export type StreamInput = {
+   messages: ModelMessage[]
+   small?: boolean
+   tools: Record<string, Tool>
++  /** Lowers the output limit to at most this, thinking budget included. */
++  maxOutputTokens?: number
+   retries?: number
+   toolChoice?: "auto" | "required" | "none"
+ }
+diff --git a/packages/opencode/src/session/llm/request.ts b/packages/opencode/src/session/llm/request.ts
+index ef15ef8..ebc0490 100644
+--- a/packages/opencode/src/session/llm/request.ts
++++ b/packages/opencode/src/session/llm/request.ts
+@@ -27,6 +27,7 @@ type PrepareInput = {
+   readonly messages: ModelMessage[]
+   readonly small?: boolean
+   readonly tools: Record<string, Tool>
++  readonly maxOutputTokens?: number
+   readonly provider: Provider.Info
+   readonly auth: Auth.Info | undefined
+   readonly plugin: Plugin.Interface
+@@ -129,6 +130,15 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
+       options,
+     },
+   )
++  if (input.maxOutputTokens !== undefined) {
++    // A fixed thinking budget is sent on top of the output limit (`max_tokens = maxOutputTokens + budgetTokens`),
++    // so the limit gives up that much, but never all of it: `max_tokens` must stay above the budget.
++    const budget = params.options.thinking?.type === "enabled" ? (params.options.thinking.budgetTokens ?? 1024) : 0
++    params.maxOutputTokens = Math.max(
++      1,
++      Math.min(params.maxOutputTokens ?? Number.POSITIVE_INFINITY, input.maxOutputTokens - budget),
++    )
++  }
+ 
+   const { headers } = yield* input.plugin.trigger(
+     "chat.headers",
+diff --git a/packages/opencode/src/session/processor.ts b/packages/opencode/src/session/processor.ts
+index 9f85309..73293e7 100644
+--- a/packages/opencode/src/session/processor.ts
++++ b/packages/opencode/src/session/processor.ts
+@@ -113,6 +113,8 @@ const layer = Layer.effect(
+         reasoningMap: {},
+       }
+       let aborted = false
++      // A summary that calls a tool is cut off there and left to the caller, which can ask again.
++      let summaryToolCall = false
+ 
+       const parse = (e: unknown) =>
+         MessageV2.fromError(e, {
+@@ -276,6 +278,17 @@ const layer = Layer.effect(
+       }
+ 
+       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
++        if (
++          ctx.assistantMessage.summary &&
++          (value.type === "tool-input-start" ||
++            value.type === "tool-input-delta" ||
++            value.type === "tool-input-end" ||
++            value.type === "tool-call")
++        ) {
++          summaryToolCall = true
++          ctx.assistantMessage.finish = "tool-calls"
++          return
++        }
+         switch (value.type) {
+           case "reasoning-start":
+             if (value.id in ctx.reasoningMap) return
+@@ -313,9 +326,6 @@ const layer = Layer.effect(
+             return
+ 
+           case "tool-input-start":
+-            if (ctx.assistantMessage.summary) {
+-              throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
+-            }
+             yield* ensureToolCall(value)
+             return
+ 
+@@ -329,9 +339,6 @@ const layer = Layer.effect(
+           }
+ 
+           case "tool-call": {
+-            if (ctx.assistantMessage.summary) {
+-              throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
+-            }
+             yield* ensureToolCall(value)
+             const input = isRecord(value.input) ? value.input : { value: value.input }
+             yield* updateToolCall(value.id, (match) => ({
+@@ -618,6 +625,12 @@ const layer = Layer.effect(
+           stack: e instanceof Error ? e.stack : undefined,
+         })
+         const error = parse(e)
++        // A failed summary attempt is retried or recorded by compaction, which reports the outcome once.
++        if (ctx.assistantMessage.summary && !aborted) {
++          if (SessionV1.ContextOverflowError.isInstance(error)) ctx.needsCompaction = true
++          else ctx.assistantMessage.error = error
++          return
++        }
+         if (SessionV1.ContextOverflowError.isInstance(error)) {
+           if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
+             ctx.assistantMessage.error = error
+@@ -644,6 +657,7 @@ const layer = Layer.effect(
+           messageID: input.assistantMessage.id,
+         })
+         ctx.needsCompaction = false
++        summaryToolCall = false
+         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+ 
+         return yield* Effect.gen(function* () {
+@@ -655,7 +669,7 @@ const layer = Layer.effect(
+ 
+             yield* stream.pipe(
+               Stream.tap((event) => handleEvent(event)),
+-              Stream.takeUntil(() => ctx.needsCompaction),
++              Stream.takeUntil(() => ctx.needsCompaction || summaryToolCall),
+               Stream.runDrain,
+             )
+           }).pipe(
+diff --git a/packages/opencode/src/session/prompt.ts b/packages/opencode/src/session/prompt.ts
+index 0f85d44..92f3873 100644
+--- a/packages/opencode/src/session/prompt.ts
++++ b/packages/opencode/src/session/prompt.ts
+@@ -1078,6 +1078,87 @@ const layer = Layer.effect(
+       throw new Error("Impossible")
+     })
+ 
++    /** The model request for a turn on `messages`; compaction appends its summary prompt to the same request. */
++    const assemble = Effect.fn("SessionPrompt.assemble")(function* (input: {
++      session: Session.Info
++      agent: Agent.Info
++      user: SessionV1.User
++      model: Provider.Model
++      messages: SessionV1.WithParts[]
++      processor: SessionProcessor.Handle
++      prompt?: SessionV1.WithParts
++      onStructured?: (output: unknown) => void
++    }) {
++      const msgs = yield* SessionReminders.apply({
++        messages: input.messages,
++        agent: input.agent,
++        session: input.session,
++      }).pipe(
++        Effect.provideService(RuntimeFlags.Service, flags),
++        Effect.provideService(FSUtil.Service, fsys),
++        Effect.provideService(Session.Service, sessions),
++      )
++      const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
++      const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
++      const promptOps = yield* ops()
++
++      const tools = yield* SessionTools.resolve({
++        agent: input.agent,
++        session: input.session,
++        model: input.model,
++        processor: input.processor,
++        bypassAgentCheck,
++        messages: msgs,
++        promptOps,
++      }).pipe(
++        Effect.provideService(Plugin.Service, plugin),
++        Effect.provideService(Permission.Service, permission),
++        Effect.provideService(ToolRegistry.Service, registry),
++        Effect.provideService(MCP.Service, mcp),
++        Effect.provideService(Truncate.Service, truncate),
++        Effect.provideService(RuntimeFlags.Service, flags),
++      )
++
++      const format = input.user.format ?? { type: "text" as const }
++      if (format.type === "json_schema") {
++        tools["StructuredOutput"] = createStructuredOutputTool({
++          schema: format.schema,
++          onSuccess(output) {
++            input.onStructured?.(output)
++          },
 +        })
 +      }
-+      let result = yield* summarize(entries.join("\n\n"))
-+      // Too long for the model: the oldest history goes first, as the summary must carry the recent work.
-+      let start = 0
-+      for (let retry = 0; result === "compact" && retry < SUMMARY_RETRIES && entries.length - start > 1; retry++) {
-+        start += oldestQuarter(entries.slice(start))
-+        result = yield* summarize([HISTORY_CUT, ...entries.slice(start)].join("\n\n"))
-+      }
++
++      if (input.prompt) msgs.push(input.prompt)
++      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
++
++      const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
++        sys.skills(input.agent),
++        sys.environment(input.model),
++        instruction.system().pipe(Effect.orDie),
++        sys.mcp(input.agent, input.session.permission),
++        MessageV2.toModelMessagesEffect(msgs, input.model),
++      ])
++      const system = [
++        ...env,
++        ...instructions,
++        ...(mcpInstructions ? [mcpInstructions] : []),
++        ...(skills ? [skills] : []),
++      ]
++      if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
++      return {
++        user: input.user,
++        agent: input.agent,
++        permission: input.session.permission,
++        sessionID: input.session.id,
++        parentSessionID: input.session.parentID,
++        system,
++        messages: modelMsgs,
++        tools,
++        model: input.model,
++      } satisfies LLM.StreamInput
++    })
++
+     const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
+       function* (sessionID: SessionID) {
+         const ctx = yield* InstanceState.context
+@@ -1089,7 +1170,7 @@ const layer = Layer.effect(
+           yield* status.set(sessionID, { type: "busy" })
+           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
  
-       if (result === "compact") {
-         processor.message.error = new SessionV1.ContextOverflowError({
+-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
++          const msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+             Effect.provideService(Database.Service, database),
+           )
+ 
+@@ -1153,6 +1234,12 @@ const layer = Layer.effect(
+               sessionID,
+               auto: task.auto,
+               overflow: task.overflow,
++              live: (input) =>
++                Effect.gen(function* () {
++                  const agent = yield* agents.get(input.user.agent)
++                  if (!agent) return undefined
++                  return yield* assemble({ ...input, session, agent })
++                }),
+             })
+             if (result === "stop") break
+             continue
+@@ -1177,11 +1264,6 @@ const layer = Layer.effect(
+           }
+           const maxSteps = agent.steps ?? Infinity
+           const isLastStep = step >= maxSteps
+-          msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
+-            Effect.provideService(RuntimeFlags.Service, flags),
+-            Effect.provideService(FSUtil.Service, fsys),
+-            Effect.provideService(Session.Service, sessions),
+-          )
+ 
+           const msg: SessionV1.Assistant = {
+             id: MessageID.ascending(),
+@@ -1219,69 +1301,27 @@ const layer = Layer.effect(
+             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
+ 
+           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
+-            const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
+-            const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
+-            const promptOps = yield* ops()
++            if (step === 1)
++              yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
+ 
+-            const tools = yield* SessionTools.resolve({
+-              agent,
++            const request = yield* assemble({
+               session,
++              agent,
++              user: lastUser,
+               model,
+-              processor: handle,
+-              bypassAgentCheck,
+               messages: msgs,
+-              promptOps,
+-            }).pipe(
+-              Effect.provideService(Plugin.Service, plugin),
+-              Effect.provideService(Permission.Service, permission),
+-              Effect.provideService(ToolRegistry.Service, registry),
+-              Effect.provideService(MCP.Service, mcp),
+-              Effect.provideService(Truncate.Service, truncate),
+-              Effect.provideService(RuntimeFlags.Service, flags),
+-            )
+-
+-            if (lastUser.format?.type === "json_schema") {
+-              tools["StructuredOutput"] = createStructuredOutputTool({
+-                schema: lastUser.format.schema,
+-                onSuccess(output) {
+-                  structured = output
+-                },
+-              })
+-            }
+-
+-            if (step === 1)
+-              yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
+-
+-            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+-
+-            const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
+-              sys.skills(agent),
+-              sys.environment(model),
+-              instruction.system().pipe(Effect.orDie),
+-              sys.mcp(agent, session.permission),
+-              MessageV2.toModelMessagesEffect(msgs, model),
+-            ])
+-            const system = [
+-              ...env,
+-              ...instructions,
+-              ...(mcpInstructions ? [mcpInstructions] : []),
+-              ...(skills ? [skills] : []),
+-            ]
++              processor: handle,
++              onStructured(output) {
++                structured = output
++              },
++            })
+             const format = lastUser.format ?? { type: "text" as const }
+-            if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+             const result = yield* handle.process({
+-              user: lastUser,
+-              agent,
+-              permission: session.permission,
+-              sessionID,
+-              parentSessionID: session.parentID,
+-              system,
++              ...request,
+               messages: [
+-                ...modelMsgs,
++                ...request.messages,
+                 ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
+               ],
+-              tools,
+-              model,
+               toolChoice: format.type === "json_schema" ? "required" : undefined,
+             })
+ 
 diff --git a/packages/opencode/test/session/compaction.test.ts b/packages/opencode/test/session/compaction.test.ts
-index c76dd98..7677029 100644
+index c76dd98..557e428 100644
 --- a/packages/opencode/test/session/compaction.test.ts
 +++ b/packages/opencode/test/session/compaction.test.ts
-@@ -337,6 +337,31 @@ function reply(
+@@ -3,7 +3,9 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
+ import { SessionV1 } from "@opencode-ai/core/v1/session"
+ import { Database } from "@opencode-ai/core/database/database"
+ import { EventV2Bridge } from "@/event-v2-bridge"
+-import { APICallError } from "ai"
++import { APICallError, tool } from "ai"
++import z from "zod"
++import type { Agent } from "@/agent/agent"
+ import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
+ import * as Stream from "effect/Stream"
+ import { Config } from "@/config/config"
+@@ -217,9 +219,18 @@ function processorLayer(result: "continue" | "compact") {
+   )
+ }
+ 
+-function cfg(compaction?: ConfigV1.Info["compaction"]) {
++function cfg(compaction?: ConfigV1.Info["compaction"], agent?: ConfigV1.Info["agent"]) {
+   const base = Schema.decodeUnknownSync(ConfigV1.Info)({}) as ConfigV1.Info
+-  return Layer.succeed(Config.Service, TestConfig.make({ get: () => Effect.succeed({ ...base, compaction }) }))
++  return Layer.succeed(Config.Service, TestConfig.make({ get: () => Effect.succeed({ ...base, compaction, agent }) }))
++}
++
++function small() {
++  const session = createModel({ context: 100_000, output: 32_000 })
++  const compact = { ...createModel({ context: 8_000, output: 2_000 }), id: ModelV2.ID.make("small-model") }
++  return ProviderTest.fake({
++    model: session,
++    getModel: (_providerID, modelID) => Effect.succeed(modelID === compact.id ? compact : session),
++  })
+ }
+ 
+ const defaultProvider = wide()
+@@ -337,6 +348,144 @@ function reply(
    }
  }
  
-+function tooLong(capture?: (input: LLM.StreamInput) => void) {
++function tooLongError() {
 +  const message = "prompt is too long: 1037248 tokens > 1000000 maximum"
++  return new APICallError({
++    message,
++    url: "https://example.com/v1/messages",
++    requestBodyValues: {},
++    statusCode: 400,
++    responseHeaders: { "content-type": "application/json" },
++    responseBody: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }),
++    isRetryable: false,
++  })
++}
++
++function tooLong(capture?: (input: LLM.StreamInput) => void) {
 +  return (input: LLM.StreamInput) => {
 +    capture?.(input)
-+    return Stream.fail(
-+      new APICallError({
-+        message,
-+        url: "https://example.com/v1/messages",
-+        requestBodyValues: {},
-+        statusCode: 400,
-+        responseHeaders: { "content-type": "application/json" },
-+        responseBody: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }),
-+        isRetryable: false,
-+      }),
++    return Stream.fail(tooLongError())
++  }
++}
++
++function partialThenTooLong(capture?: (input: LLM.StreamInput) => void) {
++  return (input: LLM.StreamInput) => {
++    capture?.(input)
++    return Stream.make(
++      LLMEvent.textStart({ id: "txt-0" }),
++      LLMEvent.textDelta({ id: "txt-0", text: "partial" }),
++    ).pipe(Stream.concat(Stream.fail(tooLongError())))
++  }
++}
++
++function toolCall(capture?: (input: LLM.StreamInput) => void) {
++  return (input: LLM.StreamInput) => {
++    capture?.(input)
++    return Stream.make(
++      LLMEvent.toolInputStart({ id: "call-1", name: "probe" }),
++      LLMEvent.toolCall({ id: "call-1", name: "probe", input: {} }),
++      LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: basicUsage() }),
++      LLMEvent.finish({ reason: "tool-calls", usage: basicUsage() }),
 +    )
 +  }
 +}
 +
-+function createTurns(sessionID: SessionID, count: number) {
++function empty(capture?: (input: LLM.StreamInput) => void) {
++  return (input: LLM.StreamInput) => {
++    capture?.(input)
++    return Stream.make(
++      LLMEvent.stepFinish({ index: 0, reason: "stop", usage: basicUsage() }),
++      LLMEvent.finish({ reason: "stop", usage: basicUsage() }),
++    )
++  }
++}
++
++const headed = (text: string) => `## Objective\n- ${text}`
++
++const textOf = (input: LLM.StreamInput) => JSON.stringify(input.messages)
++
++function createTurns(sessionID: SessionID, count: number, size = 100) {
 +  return Effect.forEach(
 +    Array.from({ length: count }, (_, index) => index + 1),
-+    (turn) => createUserMessage(sessionID, `turn-${turn} ${"x".repeat(100)}`),
++    (turn) => createUserMessage(sessionID, `turn-${turn} ${"x".repeat(size)}`),
 +  )
++}
++
++function summaryOf(sessionID: SessionID) {
++  return SessionNs.use
++    .messages({ sessionID })
++    .pipe(Effect.map((messages) => messages.findLast((msg) => msg.info.role === "assistant" && msg.info.summary)))
++}
++
++function countErrors(sessionID: SessionID) {
++  return Effect.gen(function* () {
++    const events = yield* EventV2Bridge.Service
++    const seen = { count: 0 }
++    const off = yield* events.listen((evt) => {
++      if (evt.type !== SessionNs.Event.Error.type) return Effect.void
++      if ((evt.data as typeof SessionNs.Event.Error.data.Type).sessionID === sessionID) seen.count++
++      return Effect.void
++    })
++    yield* Effect.addFinalizer(() => off)
++    return seen
++  })
++}
++
++function createMeasuredTurn(
++  sessionID: SessionID,
++  root: string,
++  input: number,
++  options?: { variant?: string; format?: SessionV1.User["format"] },
++) {
++  return Effect.gen(function* () {
++    const ssn = yield* SessionNs.Service
++    const ask = yield* ssn.updateMessage({
++      id: MessageID.ascending(),
++      role: "user",
++      sessionID,
++      agent: "build",
++      model: ref,
++      format: options?.format,
++      time: { created: Date.now() },
++    })
++    yield* ssn.updatePart({ id: PartID.ascending(), messageID: ask.id, sessionID, type: "text", text: "do the task" })
++    const answer = yield* createAssistantMessage(sessionID, ask.id, root)
++    yield* ssn.updateMessage({
++      ...answer,
++      variant: options?.variant,
++      tokens: { input, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
++    })
++    yield* ssn.updatePart({
++      id: PartID.ascending(),
++      messageID: answer.id,
++      sessionID,
++      type: "text",
++      text: "working on it",
++    })
++  })
++}
++
++function liveRequest(calls: Array<Parameters<SessionCompaction.Live>[0]>): SessionCompaction.Live {
++  return (input) => {
++    calls.push(input)
++    return Effect.succeed({
++      user: input.user,
++      agent: { name: "build", mode: "primary", options: {}, permission: [] } satisfies Agent.Info,
++      sessionID: input.user.sessionID,
++      system: ["live system"],
++      messages: [
++        { role: "user", content: [{ type: "text", text: "live prefix" }] },
++        {
++          role: "user",
++          content: input.prompt.parts.flatMap((part) => (part.type === "text" ? [{ type: "text", text: part.text }] : [])),
++        },
++      ],
++      tools: { probe: tool({ description: "probe", inputSchema: z.object({}), execute: async () => "ran" }) },
++      model: input.model,
++    })
++  }
 +}
 +
  function plugin(ready: Deferred.Deferred<void>) {
    return Layer.mock(Plugin.Service)({
      trigger: <Name extends string, Input, Output>(name: Name, _input: Input, output: Output) => {
-@@ -904,6 +929,125 @@ describe("session.compaction.process", () => {
+@@ -365,6 +514,20 @@ function autocontinue(enabled: boolean) {
+   })
+ }
+ 
++function compactionPrompt(prompt: string) {
++  return Layer.mock(Plugin.Service)({
++    trigger: <Name extends string, Input, Output>(name: Name, _input: Input, output: Output) => {
++      if (name !== "experimental.session.compacting") return Effect.succeed(output)
++      return Effect.sync(() => {
++        ;(output as { prompt?: string }).prompt = prompt
++        return output
++      })
++    },
++    list: () => Effect.succeed([]),
++    init: () => Effect.void,
++  })
++}
++
+ function compactionContext(context: string) {
+   return Layer.mock(Plugin.Service)({
+     trigger: <Name extends string, Input, Output>(name: Name, _input: Input, output: Output) => {
+@@ -904,6 +1067,450 @@ describe("session.compaction.process", () => {
      }).pipe(withCompaction({ result: "compact" })),
    )
  
@@ -219,17 +1261,18 @@ index c76dd98..7677029 100644
 +  )
 +
 +  itCompaction.instance(
-+    "sends a summary request the model refuses as too long again without the oldest history",
++    "shortens a summary request the model refuses as too long, keeping the opening and newest exchanges",
 +    () => {
 +      const stub = llm()
 +      const requests: string[] = []
-+      const capture = (input: LLM.StreamInput) => requests.push(JSON.stringify(input.messages))
-+      stub.push(tooLong(capture))
-+      stub.push(reply("summary", capture))
++      const capture = (input: LLM.StreamInput) => requests.push(textOf(input))
++      for (let i = 0; i < 3; i++) stub.push(tooLong(capture))
++      stub.push(reply(headed("summary"), capture))
 +      return Effect.gen(function* () {
 +        const ssn = yield* SessionNs.Service
 +        const session = yield* ssn.create({})
-+        yield* createTurns(session.id, 4)
++        const errors = yield* countErrors(session.id)
++        yield* createTurns(session.id, 6, 4_000)
 +        yield* createSummaryCompaction(session.id)
 +
 +        const msgs = yield* ssn.messages({ sessionID: session.id })
@@ -239,34 +1282,37 @@ index c76dd98..7677029 100644
 +          sessionID: session.id,
 +          auto: false,
 +        })
-+        const summaries = (yield* ssn.messages({ sessionID: session.id })).filter(
-+          (msg) => msg.info.role === "assistant" && msg.info.summary,
-+        )
++        const summary = yield* summaryOf(session.id)
 +
 +        expect(result).toBe("continue")
-+        expect(requests).toHaveLength(2)
-+        expect(requests[0]).toContain("turn-1")
-+        expect(requests[1]).not.toContain("turn-1")
-+        for (const turn of [2, 3, 4]) expect(requests[1]).toContain(`turn-${turn}`)
-+        expect(summaries).toHaveLength(1)
-+        const summary = summaries[0]
-+        expect(summary.info.role === "assistant" && summary.info.error).toBeUndefined()
-+        expect(summary.parts.some((part) => part.type === "text" && part.text === "summary")).toBe(true)
++        expect(requests).toHaveLength(4)
++        for (let i = 1; i < requests.length; i++) expect(requests[i].length).toBeLessThan(requests[i - 1].length)
++        expect(requests[1]).toContain("characters omitted")
++        expect(requests[3]).toContain("turn-1 ")
++        expect(requests[3]).toContain("turn-6 ")
++        expect(requests[3]).not.toContain("turn-2 ")
++        expect(requests[3]).toMatch(/\[\d+ older exchanges? omitted\]/)
++        expect(summary?.info.role === "assistant" && summary.info.error).toBeUndefined()
++        expect(summary?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
++          headed("summary"),
++        ])
++        expect(errors.count).toBe(0)
 +      }).pipe(withCompaction({ llm: stub.llmLayer }))
 +    },
 +    { git: true },
 +  )
 +
 +  itCompaction.instance(
-+    "stops after three shorter summary requests the model refuses as too long",
++    "stops with one error once every shorter summary request is refused as too long",
 +    () => {
 +      const stub = llm()
 +      const requests: string[] = []
-+      for (let i = 0; i < 5; i++) stub.push(tooLong((input) => requests.push(JSON.stringify(input.messages))))
++      for (let i = 0; i < 6; i++) stub.push(tooLong((input) => requests.push(textOf(input))))
 +      return Effect.gen(function* () {
 +        const ssn = yield* SessionNs.Service
 +        const session = yield* ssn.create({})
-+        yield* createTurns(session.id, 4)
++        const errors = yield* countErrors(session.id)
++        yield* createTurns(session.id, 8, 4_000)
 +        yield* createSummaryCompaction(session.id)
 +
 +        const msgs = yield* ssn.messages({ sessionID: session.id })
@@ -276,23 +1322,605 @@ index c76dd98..7677029 100644
 +          sessionID: session.id,
 +          auto: false,
 +        })
-+        const summaries = (yield* ssn.messages({ sessionID: session.id })).filter(
-+          (msg) => msg.info.role === "assistant" && msg.info.summary,
-+        )
++        const summary = (yield* summaryOf(session.id))?.info
 +
 +        expect(result).toBe("stop")
-+        expect(requests).toHaveLength(4)
-+        expect(requests[3]).toContain("turn-4")
-+        for (const turn of [1, 2, 3]) expect(requests[3]).not.toContain(`turn-${turn}`)
-+        expect(summaries).toHaveLength(1)
-+        const summary = summaries[0].info
-+        expect(summary.role === "assistant" && summary.finish).toBe("error")
-+        expect(summary.role === "assistant" && summary.error?.name).toBe("ContextOverflowError")
++        expect(requests).toHaveLength(5)
++        expect(requests[4]).toContain("turn-8 ")
++        expect(summary?.role === "assistant" && summary.finish).toBe("error")
++        expect(summary?.role === "assistant" && summary.error?.name).toBe("ContextOverflowError")
++        expect(errors.count).toBe(1)
 +      }).pipe(withCompaction({ llm: stub.llmLayer }))
 +    },
 +    { git: true },
 +  )
 +
++  itCompaction.instance(
++    "clears a refused attempt's partial reply before sending a shorter one",
++    () => {
++      const stub = llm()
++      stub.push(partialThenTooLong())
++      stub.push(reply(headed("summary")))
++      return Effect.gen(function* () {
++        const ssn = yield* SessionNs.Service
++        const session = yield* ssn.create({})
++        yield* createTurns(session.id, 4, 4_000)
++        yield* createSummaryCompaction(session.id)
++
++        const msgs = yield* ssn.messages({ sessionID: session.id })
++        const result = yield* SessionCompaction.use.process({
++          parentID: msgs.at(-1)!.info.id,
++          messages: msgs,
++          sessionID: session.id,
++          auto: false,
++        })
++        const summary = yield* summaryOf(session.id)
++
++        expect(result).toBe("continue")
++        expect(summary?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
++          headed("summary"),
++        ])
++      }).pipe(withCompaction({ llm: stub.llmLayer }))
++    },
++    { git: true },
++  )
++
++  itCompaction.instance(
++    "reminds the model of the template once and keeps its first summary when that does not help",
++    () => {
++      const stub = llm()
++      const requests: string[] = []
++      const capture = (input: LLM.StreamInput) => requests.push(textOf(input))
++      stub.push(reply("plain summary", capture))
++      stub.push(reply("still plain", capture))
++      return Effect.gen(function* () {
++        const ssn = yield* SessionNs.Service
++        const session = yield* ssn.create({})
++        yield* createTurns(session.id, 2)
++        yield* createSummaryCompaction(session.id)
++
++        const msgs = yield* ssn.messages({ sessionID: session.id })
++        yield* SessionCompaction.use.process({
++          parentID: msgs.at(-1)!.info.id,
++          messages: msgs,
++          sessionID: session.id,
++          auto: false,
++        })
++        const summary = yield* summaryOf(session.id)
++
++        expect(requests).toHaveLength(2)
++        expect(requests[0]).not.toContain("did not fill in the required summary template")
++        expect(requests[1]).toContain("did not fill in the required summary template")
++        expect(summary?.info.role === "assistant" && summary.info.finish).toBe("stop")
++        expect(summary?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
++          "plain summary",
++        ])
++      }).pipe(withCompaction({ llm: stub.llmLayer }))
++    },
++    { git: true },
++  )
++
++  itCompaction.instance(
++    "keeps the reminded summary when it fills the template",
++    () => {
++      const stub = llm()
++      stub.push(reply("plain summary"))
++      stub.push(reply(headed("fixed summary")))
++      return Effect.gen(function* () {
++        const ssn = yield* SessionNs.Service
++        const session = yield* ssn.create({})
++        yield* createTurns(session.id, 2)
++        yield* createSummaryCompaction(session.id)
++
++        const msgs = yield* ssn.messages({ sessionID: session.id })
++        yield* SessionCompaction.use.process({
++          parentID: msgs.at(-1)!.info.id,
++          messages: msgs,
++          sessionID: session.id,
++          auto: false,
++        })
++        const summary = yield* summaryOf(session.id)
++
++        expect(summary?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
++          headed("fixed summary"),
++        ])
++      }).pipe(withCompaction({ llm: stub.llmLayer }))
++    },
++    { git: true },
++  )
++
++  itCompaction.instance(
++    "does not remind the model of the template when a plugin replaces the compaction prompt",
++    () => {
++      const stub = llm()
++      const requests: string[] = []
++      stub.push(reply("plain summary", (input) => requests.push(textOf(input))))
++      return Effect.gen(function* () {
++        const ssn = yield* SessionNs.Service
++        const session = yield* ssn.create({})
++        yield* createTurns(session.id, 2)
++        yield* createSummaryCompaction(session.id)
++
++        const msgs = yield* ssn.messages({ sessionID: session.id })
++        yield* SessionCompaction.use.process({
++          parentID: msgs.at(-1)!.info.id,
++          messages: msgs,
++          sessionID: session.id,
++          auto: false,
++        })
++
++        expect(requests).toHaveLength(1)
++        expect(requests[0]).toContain("Summarize in one line.")
++      }).pipe(withCompaction({ llm: stub.llmLayer, plugin: compactionPrompt("Summarize in one line.") }))
++    },
++    { git: true },
++  )
++
++  itCompaction.instance(
++    "summarizes with the conversation's own request, appending the prompt and keeping tools from running",
++    () => {
++      const stub = llm()
++      const requests: LLM.StreamInput[] = []
++      const calls: Array<Parameters<SessionCompaction.Live>[0]> = []
++      stub.push(reply(headed("live summary"), (input) => requests.push(input)))
++      return Effect.gen(function* () {
++        const test = yield* TestInstance
++        const ssn = yield* SessionNs.Service
++        const session = yield* ssn.create({})
++        const errors = yield* countErrors(session.id)
++        yield* createMeasuredTurn(session.id, test.directory, 50_000)
++        yield* createSummaryCompaction(session.id)
++
++        const msgs = yield* ssn.messages({ sessionID: session.id })
++        const result = yield* SessionCompaction.use.process({
++          parentID: msgs.at(-1)!.info.id,
++          messages: msgs,
++          sessionID: session.id,
++          auto: true,
++          live: liveRequest(calls),
++        })
++        const summary = yield* summaryOf(session.id)
++
++        expect(result).toBe("continue")
++        expect(calls).toHaveLength(1)
++        expect(calls[0].messages.map((msg) => msg.info.id)).toEqual(msgs.slice(0, -1).map((msg) => msg.info.id))
++        expect(requests).toHaveLength(1)
++        expect(requests[0].system).toEqual(["live system"])
++        expect(JSON.stringify(requests[0].messages[0])).toContain("live prefix")
++        const prompt = JSON.stringify(requests[0].messages.at(-1))
++        expect(prompt).toContain("CRITICAL: Respond with TEXT ONLY")
++        expect(prompt).toContain("You MUST summarize the conversation above")
++        expect(requests[0].tools.probe?.execute).toBeUndefined()
++        expect(requests[0].maxOutputTokens).toBeGreaterThan(0)
++        expect(requests[0].maxOutputTokens!).toBeLessThanOrEqual(100_000 - 50_010)
++        expect(summary?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
++          headed("live summary"),
++        ])
++        expect(errors.count).toBe(0)
++      }).pipe(withCompaction({ llm: stub.llmLayer }))
++    },
++    { git: true },
++  )
++
++  itCompaction.instance(
++    "falls back to the text transcript when the live summary is unusable",
++    () => {
++      const stub = llm()
++      const requests: string[] = []
++      const capture = (input: LLM.StreamInput) => requests.push(textOf(input))
++      const plain = (capture: (input: LLM.StreamInput) => void) => reply("plain", capture)
++      const cases = [[toolCall], [empty], [tooLong], [plain, plain]]
++      for (const attempts of cases) {
++        for (const attempt of attempts) stub.push(attempt(capture))
++        stub.push(reply(headed("text summary"), capture))
++      }
++      return Effect.gen(function* () {
++        const test = yield* TestInstance
++        const ssn = yield* SessionNs.Service
++        for (const attempts of cases) {
++          requests.length = 0
++          const session = yield* ssn.create({})
++          const errors = yield* countErrors(session.id)
++          yield* createMeasuredTurn(session.id, test.directory, 1_000)
++          yield* createSummaryCompaction(session.id)
++
++          const msgs = yield* ssn.messages({ sessionID: session.id })
++          const result = yield* SessionCompaction.use.process({
++            parentID: msgs.at(-1)!.info.id,
++            messages: msgs,
++            sessionID: session.id,
++            auto: false,
++            live: liveRequest([]),
++          })
++          const summary = yield* summaryOf(session.id)
++
++          expect(result).toBe("continue")
++          expect(requests).toHaveLength(attempts.length + 1)
++          for (const live of requests.slice(0, -1)) expect(live).toContain("live prefix")
++          if (attempts.length === 2) expect(requests[1]).toContain("did not fill in the required summary template")
++          expect(requests.at(-1)).toContain("<conversation>")
++          expect(requests.at(-1)).not.toContain("live prefix")
++          expect(summary?.parts.some((part) => part.type === "tool")).toBe(false)
++          expect(summary?.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
++            headed("text summary"),
++          ])
++          expect(errors.count).toBe(0)
++        }
++      }).pipe(withCompaction({ llm: stub.llmLayer }))
++    },
++    { git: true },
++  )
++
++  itCompaction.instance(
++    "skips the live request when it cannot reuse the conversation's request",
++    () => {
++      const stub = llm()
++      const requests: string[] = []
++      const cases = [
++        { input: 99_000 },
++        { input: 1_000, variant: "high" },
++        {
++          input: 1_000,
++          format: new SessionV1.OutputFormatJsonSchema({ type: "json_schema", schema: { type: "object" }, retryCount: 2 }),
++        },
++        { input: 1_000, overflow: true },
++      ]
++      for (const _ of cases) stub.push(reply(headed("text summary"), (input) => requests.push(textOf(input))))
++      return Effect.gen(function* () {
++        const test = yield* TestInstance
++        const ssn = yield* SessionNs.Service
++        for (const item of cases) {
++          requests.length = 0
++          const calls: Array<Parameters<SessionCompaction.Live>[0]> = []
++          const session = yield* ssn.create({})
++          yield* createUserMessage(session.id, "earlier turn")
++          yield* createMeasuredTurn(session.id, test.directory, item.input, item)
++          yield* createSummaryCompaction(session.id)
++
++          const msgs = yield* ssn.messages({ sessionID: session.id })
++          yield* SessionCompaction.use.process({
++            parentID: msgs.at(-1)!.info.id,
++            messages: msgs,
++            sessionID: session.id,
++            auto: false,
++            overflow: item.overflow,
++            live: liveRequest(calls),
++          })
++
++          expect(calls).toEqual([])
++          expect(requests).toHaveLength(1)
++          expect(requests[0]).toContain("<conversation>")
++        }
++      }).pipe(withCompaction({ llm: stub.llmLayer }))
++    },
++    { git: true },
++  )
++
++  itCompaction.instance(
++    "ignores the model's reasoning when sizing the retained tail",
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const ssn = yield* SessionNs.Service
++      const session = yield* ssn.create({})
++      yield* createUserMessage(session.id, "older turn")
++      const recent = yield* createUserMessage(session.id, "recent turn")
++      const answer = yield* createAssistantMessage(session.id, recent.id, test.directory)
++      yield* ssn.updatePart({
++        id: PartID.ascending(),
++        messageID: answer.id,
++        sessionID: session.id,
++        type: "reasoning",
++        text: "r".repeat(40_000),
++        time: { start: Date.now(), end: Date.now() },
++      })
++      yield* ssn.updatePart({
++        id: PartID.ascending(),
++        messageID: answer.id,
++        sessionID: session.id,
++        type: "text",
++        text: "recent reply",
++      })
++      yield* createSummaryCompaction(session.id)
++
++      const msgs = yield* ssn.messages({ sessionID: session.id })
++      yield* SessionCompaction.use.process({
++        parentID: msgs.at(-1)!.info.id,
++        messages: msgs,
++        sessionID: session.id,
++        auto: false,
++      })
++
++      expect((yield* readCompactionPart(session.id))?.tail_start_id).toBe(recent.id)
++    }).pipe(withCompaction({ config: cfg({ tail_turns: 1, preserve_recent_tokens: 2_000 }) })),
++  )
++
++  itCompaction.instance(
++    "sizes the retained tail for the session's model rather than the compaction agent's",
++    Effect.gen(function* () {
++      const ssn = yield* SessionNs.Service
++      const session = yield* ssn.create({})
++      yield* createUserMessage(session.id, "older turn")
++      const recent = yield* createUserMessage(session.id, "y".repeat(16_000))
++      yield* createSummaryCompaction(session.id)
++
++      const msgs = yield* ssn.messages({ sessionID: session.id })
++      yield* SessionCompaction.use.process({
++        parentID: msgs.at(-1)!.info.id,
++        messages: msgs,
++        sessionID: session.id,
++        auto: false,
++      })
++
++      expect((yield* readCompactionPart(session.id))?.tail_start_id).toBe(recent.id)
++    }).pipe(
++      withCompaction({
++        provider: small(),
++        config: cfg({ tail_turns: 1 }, { compaction: { model: "test/small-model" } }),
++      }),
++    ),
++  )
++
    it.instance(
      "adds synthetic continue prompt when auto is enabled",
      Effect.gen(function* () {
+@@ -1357,16 +1964,26 @@ describe("session.compaction.process", () => {
+       return Effect.gen(function* () {
+         const ssn = yield* SessionNs.Service
+         const session = yield* ssn.create({})
++        const errors = yield* countErrors(session.id)
+         const msg = yield* createUserMessage(session.id, "hello")
+         const msgs = yield* ssn.messages({ sessionID: session.id })
+-        yield* SessionCompaction.use.process({ parentID: msg.id, messages: msgs, sessionID: session.id, auto: false })
++        const result = yield* SessionCompaction.use.process({
++          parentID: msg.id,
++          messages: msgs,
++          sessionID: session.id,
++          auto: false,
++        })
+ 
+         const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+           (item) => item.info.role === "assistant" && item.info.summary,
+         )
+ 
++        expect(result).toBe("stop")
+         expect(summary?.info.role).toBe("assistant")
++        expect(summary?.info.role === "assistant" && summary.info.finish).toBe("error")
++        expect(JSON.stringify(summary?.info.role === "assistant" && summary.info.error)).toContain("called a tool")
+         expect(summary?.parts.some((part) => part.type === "tool")).toBe(false)
++        expect(errors.count).toBe(1)
+       }).pipe(withCompaction({ llm: stub.llmLayer }))
+     },
+     { git: true },
+@@ -1427,9 +2044,9 @@ describe("session.compaction.process", () => {
+     () => {
+       const stub = llm()
+       let captured = ""
+-      stub.push(reply("summary one"))
++      stub.push(reply(headed("summary one")))
+       stub.push(
+-        reply("summary two", (input) => {
++        reply(headed("summary two"), (input) => {
+           captured = JSON.stringify(input.messages)
+         }),
+       )
+@@ -1579,8 +2196,8 @@ describe("session.compaction.process", () => {
+ 
+   itCompaction.instance("keeps recent pre-compaction turns across repeated compactions", () => {
+     const stub = llm()
+-    stub.push(reply("summary one"))
+-    stub.push(reply("summary two"))
++    stub.push(reply(headed("summary one")))
++    stub.push(reply(headed("summary two")))
+ 
+     return Effect.gen(function* () {
+       const ssn = yield* SessionNs.Service
+diff --git a/packages/opencode/test/session/llm.test.ts b/packages/opencode/test/session/llm.test.ts
+index ed0ad20..88a2bf9 100644
+--- a/packages/opencode/test/session/llm.test.ts
++++ b/packages/opencode/test/session/llm.test.ts
+@@ -2188,6 +2188,99 @@ describe("session.llm.stream", () => {
+     },
+   )
+ 
++  const outputLimitChunks = () => [
++    {
++      type: "message_start",
++      message: {
++        id: "msg-output-limit",
++        model: "claude",
++        usage: { input_tokens: 3, cache_creation_input_tokens: null, cache_read_input_tokens: null },
++      },
++    },
++    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
++    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
++    { type: "content_block_stop", index: 0 },
++    {
++      type: "message_delta",
++      delta: { stop_reason: "end_turn", stop_sequence: null, container: null },
++      usage: { input_tokens: 3, output_tokens: 2, cache_creation_input_tokens: null, cache_read_input_tokens: null },
++    },
++    { type: "message_stop" },
++  ]
++
++  const sendWithOutputLimit = (modelID: string, variant: string, maxOutputTokens: number) =>
++    Effect.gen(function* () {
++      const request = waitRequest("/messages", createEventResponse(outputLimitChunks()))
++      const resolved = yield* Provider.use.getModel(ProviderV2.ID.make("anthropic"), ModelV2.ID.make(modelID))
++      const sessionID = SessionID.make("session-test-output-limit")
++      const agent = {
++        name: "test",
++        mode: "primary",
++        options: {},
++        permission: [{ permission: "*", pattern: "*", action: "allow" }],
++      } satisfies Agent.Info
++      yield* drain({
++        user: {
++          id: MessageID.make("msg_user-output-limit"),
++          sessionID,
++          role: "user",
++          time: { created: Date.now() },
++          agent: agent.name,
++          model: { providerID: ProviderV2.ID.make("anthropic"), modelID: resolved.id, variant },
++        } satisfies SessionV1.User,
++        sessionID,
++        model: resolved,
++        agent,
++        system: [],
++        messages: [{ role: "user", content: "Hello" }],
++        tools: {},
++        maxOutputTokens,
++      })
++      return (yield* Effect.promise(() => request)).body
++    })
++
++  const anthropicConfig = (modelID: string) => () => {
++    const model = loadFixture("anthropic", modelID).model
++    return {
++      enabled_providers: ["anthropic"],
++      provider: {
++        anthropic: {
++          name: "Anthropic",
++          env: ["ANTHROPIC_API_KEY"],
++          npm: "@ai-sdk/anthropic",
++          api: "https://api.anthropic.com/v1",
++          models: { [model.id]: configModel(model) as ConfigModel },
++          options: { apiKey: "test-anthropic-key", baseURL: `${state.server!.url.origin}/v1` },
++        },
++      },
++    }
++  }
++
++  it.instance(
++    "keeps max_tokens within maxOutputTokens, thinking budget included",
++    () =>
++      Effect.gen(function* () {
++        const roomy = yield* sendWithOutputLimit("claude-sonnet-4-5", "high", 20_000)
++        expect(roomy.thinking).toEqual({ type: "enabled", budget_tokens: 16_000 })
++        expect(roomy.max_tokens).toBe(20_000)
++
++        const tight = yield* sendWithOutputLimit("claude-sonnet-4-5", "high", 16_000)
++        expect(tight.max_tokens).toBe(16_001)
++      }),
++    { config: anthropicConfig("claude-sonnet-4-5") },
++  )
++
++  it.instance(
++    "lowers max_tokens to maxOutputTokens with adaptive thinking",
++    () =>
++      Effect.gen(function* () {
++        const body = yield* sendWithOutputLimit("claude-opus-4-6", "max", 5_000)
++        expect(body.thinking).toMatchObject({ type: "adaptive" })
++        expect(body.max_tokens).toBe(5_000)
++      }),
++    { config: anthropicConfig("claude-opus-4-6") },
++  )
++
+   const geminiFixture = { providerID: "google", modelID: "gemini-2.5-flash" }
+   it.instance(
+     "sends Google API payload for Gemini models",
+diff --git a/packages/opencode/test/session/processor-effect.test.ts b/packages/opencode/test/session/processor-effect.test.ts
+index c67f82d..d9bff40 100644
+--- a/packages/opencode/test/session/processor-effect.test.ts
++++ b/packages/opencode/test/session/processor-effect.test.ts
+@@ -1169,3 +1169,101 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
+     { config: cfg },
+   ),
+ )
++
++itProviderError.live("session.processor effect tests end a summary at its first tool call without a tool part", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const { processors, session, provider } = yield* boot()
++        const events = yield* EventV2Bridge.Service
++
++        const chat = yield* session.create({})
++        const parent = yield* user(chat.id, "summarize")
++        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++        msg.summary = true
++        msg.finish = undefined
++        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++        const errors: string[] = []
++        const off = yield* events.listen((event) => {
++          if (event.type === Session.Event.Error.type) errors.push(event.type)
++          return Effect.void
++        })
++        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
++
++        const result = yield* handle.process({
++          user: {
++            id: parent.id,
++            sessionID: chat.id,
++            role: "user",
++            time: parent.time,
++            agent: parent.agent,
++            model: { providerID: ref.providerID, modelID: ref.modelID },
++          } satisfies SessionV1.User,
++          sessionID: chat.id,
++          model: mdl,
++          agent: agent(),
++          system: [],
++          messages: [{ role: "user", content: "summarize" }],
++          tools: {},
++        })
++        yield* off
++
++        const parts = yield* MessageV2.parts(msg.id)
++        expect(result).toBe("continue")
++        expect(handle.message.finish).toBe("tool-calls")
++        expect(handle.message.error).toBeUndefined()
++        expect(parts.some((part) => part.type === "tool")).toBe(false)
++        expect(errors).toEqual([])
++      }),
++    { config: cfg },
++  ),
++)
++
++itFragmentFailure.live("session.processor effect tests leave a failed summary's error to compaction", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const { processors, session, provider } = yield* boot()
++        const events = yield* EventV2Bridge.Service
++        const sts = yield* SessionStatus.Service
++
++        const chat = yield* session.create({})
++        const parent = yield* user(chat.id, "summarize")
++        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++        msg.summary = true
++        msg.finish = undefined
++        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++        const errors: string[] = []
++        const off = yield* events.listen((event) => {
++          if (event.type === Session.Event.Error.type) errors.push(event.type)
++          return Effect.void
++        })
++        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
++
++        const result = yield* handle.process({
++          user: {
++            id: parent.id,
++            sessionID: chat.id,
++            role: "user",
++            time: parent.time,
++            agent: parent.agent,
++            model: { providerID: ref.providerID, modelID: ref.modelID },
++          } satisfies SessionV1.User,
++          sessionID: chat.id,
++          model: mdl,
++          agent: agent(),
++          system: [],
++          messages: [{ role: "user", content: "summarize" }],
++          tools: {},
++        })
++        const state = yield* sts.get(chat.id)
++        yield* off
++
++        expect(result).toBe("stop")
++        expect(handle.message.error?.name).toBe("UnknownError")
++        expect(errors).toEqual([])
++        expect(state).toMatchObject({ type: "busy" })
++      }),
++    { config: cfg },
++  ),
++)

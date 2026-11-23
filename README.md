@@ -20,9 +20,11 @@ When nothing is carried, the release holds upstream's archive unchanged.
 
 ## What it carries
 
-- `patches/compaction-fits/`: Compaction that fits the model's context window: the summary
-  request leaves out the model's reasoning, and a summary request the model refuses as too
-  long is sent again without the oldest history, up to three times.
+- `patches/compaction-fits/`: Compaction that fits the model's context window: the summary is
+  first asked for with the conversation's own request, which reuses its prompt cache, while
+  that request leaves room for the summary. Otherwise, or when that reply is unusable, the
+  history goes as a text transcript without the model's reasoning, shortened oldest first to
+  fit, and shortened further each time the model refuses it as too long.
 
 ## How it follows upstream
 
