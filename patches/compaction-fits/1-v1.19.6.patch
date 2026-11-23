@@ -1,5 +1,5 @@
 diff --git a/packages/opencode/src/session/compaction.ts b/packages/opencode/src/session/compaction.ts
-index 75d6374..bb71f40 100644
+index 75d6374..9660bb9 100644
 --- a/packages/opencode/src/session/compaction.ts
 +++ b/packages/opencode/src/session/compaction.ts
 @@ -1,12 +1,17 @@
@@ -414,7 +414,7 @@ index 75d6374..bb71f40 100644
        const ctx = yield* InstanceState.context
        const msg: SessionV1.Assistant = {
          id: MessageID.ascending(),
-@@ -422,40 +643,204 @@ const layer = Layer.effect(
+@@ -422,40 +643,212 @@ const layer = Layer.effect(
          sessionID: input.sessionID,
          model,
        })
@@ -579,6 +579,7 @@ index 75d6374..bb71f40 100644
 +        const system = Token.estimate(agent.prompt ?? "")
 +        const fixed = Token.estimate(promptFor("")) + system + Token.estimate(NUDGE)
 +        let rejected: number | undefined
++        let refused: string | undefined
 +        for (let rejections = 0; ; ) {
 +          const target = rejected === undefined ? cap : Math.floor(rejected * SHRINK_STEPS[rejections - 1])
 +          // Until the model refuses one as too long, a transcript that cannot be shortened enough is sent whole.
@@ -586,6 +587,12 @@ index 75d6374..bb71f40 100644
 +            fit(renders, target - fixed, previousSummary === undefined) ??
 +            (rejected === undefined ? fit(renders, Number.POSITIVE_INFINITY, false) : undefined)
 +          if (conversation === undefined) return "overflow" as const
++          // The shortening goes level by level, so a smaller target can leave the refused transcript as it was.
++          if (conversation === refused) {
++            if (rejections === SHRINK_STEPS.length) return "overflow" as const
++            rejections++
++            continue
++          }
 +          const text = promptFor(conversation)
 +          const estimated = Token.estimate(text) + system
 +          const messages: ModelMessage[] = [{ role: "user", content: [{ type: "text", text }] }]
@@ -604,6 +611,7 @@ index 75d6374..bb71f40 100644
 +          if (result === "compact") {
 +            if (rejections === SHRINK_STEPS.length) return "overflow" as const
 +            rejected ??= estimated
++            refused = conversation
 +            rejections++
 +            yield* reset()
 +            continue
@@ -649,7 +657,7 @@ index 75d6374..bb71f40 100644
        }
  
        if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
-@@ -465,7 +850,7 @@ const layer = Layer.effect(
+@@ -465,7 +858,7 @@ const layer = Layer.effect(
          })
        }
  
@@ -658,7 +666,7 @@ index 75d6374..bb71f40 100644
          if (replay) {
            const original = replay.info
            const replayMsg = yield* session.updateMessage({
-@@ -549,11 +934,8 @@ const layer = Layer.effect(
+@@ -549,11 +942,8 @@ const layer = Layer.effect(
          }
        }
  
@@ -672,7 +680,7 @@ index 75d6374..bb71f40 100644
      })
  
      const create = Effect.fn("SessionCompaction.create")(function* (input: {
-@@ -602,6 +984,7 @@ export const node = LayerNode.make({
+@@ -602,6 +992,7 @@ export const node = LayerNode.make({
      Provider.node,
      EventV2Bridge.node,
      RuntimeFlags.node,
@@ -1011,7 +1019,7 @@ index 0f85d44..92f3873 100644
              })
  
 diff --git a/packages/opencode/test/session/compaction.test.ts b/packages/opencode/test/session/compaction.test.ts
-index c76dd98..557e428 100644
+index c76dd98..247e3e0 100644
 --- a/packages/opencode/test/session/compaction.test.ts
 +++ b/packages/opencode/test/session/compaction.test.ts
 @@ -3,7 +3,9 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
@@ -1212,7 +1220,7 @@ index c76dd98..557e428 100644
  function compactionContext(context: string) {
    return Layer.mock(Plugin.Service)({
      trigger: <Name extends string, Input, Output>(name: Name, _input: Input, output: Output) => {
-@@ -904,6 +1067,450 @@ describe("session.compaction.process", () => {
+@@ -904,6 +1067,499 @@ describe("session.compaction.process", () => {
      }).pipe(withCompaction({ result: "compact" })),
    )
  
@@ -1329,6 +1337,55 @@ index c76dd98..557e428 100644
 +        expect(requests[4]).toContain("turn-8 ")
 +        expect(summary?.role === "assistant" && summary.finish).toBe("error")
 +        expect(summary?.role === "assistant" && summary.error?.name).toBe("ContextOverflowError")
++        expect(errors.count).toBe(1)
++      }).pipe(withCompaction({ llm: stub.llmLayer }))
++    },
++    { git: true },
++  )
++
++  itCompaction.instance(
++    "does not send again a transcript that comes out the same as the one refused as too long",
++    () => {
++      const stub = llm()
++      const requests: string[] = []
++      for (let i = 0; i < 5; i++) stub.push(tooLong((input) => requests.push(textOf(input))))
++      return Effect.gen(function* () {
++        const test = yield* TestInstance
++        const ssn = yield* SessionNs.Service
++        const session = yield* ssn.create({})
++        const errors = yield* countErrors(session.id)
++        const ask = yield* createUserMessage(session.id, "read the log")
++        const answer = yield* createAssistantMessage(session.id, ask.id, test.directory)
++        yield* ssn.updatePart({
++          id: PartID.ascending(),
++          messageID: answer.id,
++          sessionID: session.id,
++          type: "tool",
++          callID: "read-call",
++          tool: "read",
++          state: {
++            status: "completed",
++            input: { filePath: "log.txt" },
++            output: "o".repeat(40_000),
++            title: "log.txt",
++            metadata: {},
++            time: { start: Date.now(), end: Date.now() },
++          },
++        })
++        yield* createUserMessage(session.id, "now what")
++        yield* createSummaryCompaction(session.id)
++
++        const msgs = yield* ssn.messages({ sessionID: session.id })
++        const result = yield* SessionCompaction.use.process({
++          parentID: msgs.at(-1)!.info.id,
++          messages: msgs,
++          sessionID: session.id,
++          auto: false,
++        })
++
++        expect(result).toBe("stop")
++        expect(requests).toHaveLength(2)
++        expect(requests[1]).toContain("characters omitted")
 +        expect(errors.count).toBe(1)
 +      }).pipe(withCompaction({ llm: stub.llmLayer }))
 +    },
@@ -1663,7 +1720,7 @@ index c76dd98..557e428 100644
    it.instance(
      "adds synthetic continue prompt when auto is enabled",
      Effect.gen(function* () {
-@@ -1357,16 +1964,26 @@ describe("session.compaction.process", () => {
+@@ -1357,16 +2013,26 @@ describe("session.compaction.process", () => {
        return Effect.gen(function* () {
          const ssn = yield* SessionNs.Service
          const session = yield* ssn.create({})
@@ -1691,7 +1748,7 @@ index c76dd98..557e428 100644
        }).pipe(withCompaction({ llm: stub.llmLayer }))
      },
      { git: true },
-@@ -1427,9 +2044,9 @@ describe("session.compaction.process", () => {
+@@ -1427,9 +2093,9 @@ describe("session.compaction.process", () => {
      () => {
        const stub = llm()
        let captured = ""
@@ -1703,7 +1760,7 @@ index c76dd98..557e428 100644
            captured = JSON.stringify(input.messages)
          }),
        )
-@@ -1579,8 +2196,8 @@ describe("session.compaction.process", () => {
+@@ -1579,8 +2245,8 @@ describe("session.compaction.process", () => {
  
    itCompaction.instance("keeps recent pre-compaction turns across repeated compactions", () => {
      const stub = llm()
