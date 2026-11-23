@@ -16,10 +16,12 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
   messages: SessionV1.WithParts[]
   agent: Agent.Info
   session: Session.Info
+  persist?: boolean
 }) {
   const flags = yield* RuntimeFlags.Service
   const fsys = yield* FSUtil.Service
   const sessions = yield* Session.Service
+  const persist = input.persist !== false
   const userMessage = input.messages.findLast((msg) => msg.info.role === "user")
   if (!userMessage) return input.messages
 
@@ -53,7 +55,7 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
     const ctx = yield* InstanceState.context
     const plan = Session.plan(input.session, ctx)
     const exists = yield* fsys.existsSafe(plan)
-    const part = yield* sessions.updatePart({
+    const draft: SessionV1.TextPart = {
       id: PartID.ascending(),
       messageID: userMessage.info.id,
       sessionID: userMessage.info.sessionID,
@@ -62,7 +64,8 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
         ? `${BUILD_SWITCH}\n\nA plan file exists at ${plan}. You should execute on the plan defined within it`
         : BUILD_SWITCH,
       synthetic: true,
-    })
+    }
+    const part = persist ? yield* sessions.updatePart(draft) : draft
     userMessage.parts.push(part)
     return input.messages
   }
@@ -72,8 +75,8 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
   const ctx = yield* InstanceState.context
   const plan = Session.plan(input.session, ctx)
   const exists = yield* fsys.existsSafe(plan)
-  if (!exists) yield* fsys.ensureDir(path.dirname(plan)).pipe(Effect.catch(Effect.die))
-  const part = yield* sessions.updatePart({
+  if (!exists && persist) yield* fsys.ensureDir(path.dirname(plan)).pipe(Effect.catch(Effect.die))
+  const draft: SessionV1.TextPart = {
     id: PartID.ascending(),
     messageID: userMessage.info.id,
     sessionID: userMessage.info.sessionID,
@@ -84,7 +87,8 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
         : `No plan file exists yet. You should create your plan at ${plan} using the write tool.`,
     ),
     synthetic: true,
-  })
+  }
+  const part = persist ? yield* sessions.updatePart(draft) : draft
   userMessage.parts.push(part)
   return input.messages
 })

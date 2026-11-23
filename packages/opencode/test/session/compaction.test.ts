@@ -2,6 +2,7 @@ import { afterEach, describe, expect, mock, test } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
+import { NamedError } from "@opencode-ai/core/util/error"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { APICallError, tool } from "ai"
 import z from "zod"
@@ -11,6 +12,8 @@ import * as Stream from "effect/Stream"
 import { Config } from "@/config/config"
 import { LLM } from "../../src/session/llm"
 import { SessionCompaction } from "../../src/session/compaction"
+import { SessionReminders } from "../../src/session/reminders"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Token } from "@/util/token"
 import { Plugin } from "../../src/plugin"
 import { provideTmpdirInstance, TestInstance } from "../fixture/fixture"
@@ -261,6 +264,7 @@ type CompactionProcessOptions = {
   plugin?: Layer.Layer<Plugin.Service>
   provider?: ReturnType<typeof wide>
   config?: Layer.Layer<Config.Service>
+  outputTokenMax?: number
 }
 
 function withCompaction(options?: CompactionProcessOptions) {
@@ -270,7 +274,13 @@ function withCompaction(options?: CompactionProcessOptions) {
 function compactionProcessLayer(options?: CompactionProcessOptions) {
   const replacements: LayerNode.Replacements = [
     [Provider.node, (options?.provider ?? wide()).layer],
-    [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
+    [
+      RuntimeFlags.node,
+      RuntimeFlags.layer({
+        experimentalEventSystem: true,
+        ...(options?.outputTokenMax !== undefined ? { outputTokenMax: options.outputTokenMax } : {}),
+      }),
+    ],
     [SessionSummary.node, summary],
   ]
   if (!options?.llm) {
@@ -348,23 +358,29 @@ function reply(
   }
 }
 
-function tooLongError() {
-  const message = "prompt is too long: 1037248 tokens > 1000000 maximum"
+function tooLongError(message = "prompt is too long: 1037248 tokens > 1000000 maximum", statusCode = 400) {
   return new APICallError({
     message,
     url: "https://example.com/v1/messages",
     requestBodyValues: {},
-    statusCode: 400,
+    statusCode,
     responseHeaders: { "content-type": "application/json" },
     responseBody: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }),
     isRetryable: false,
   })
 }
 
-function tooLong(capture?: (input: LLM.StreamInput) => void) {
+function tooLong(capture?: (input: LLM.StreamInput) => void, message?: string, statusCode?: number) {
   return (input: LLM.StreamInput) => {
     capture?.(input)
-    return Stream.fail(tooLongError())
+    return Stream.fail(tooLongError(message, statusCode))
+  }
+}
+
+function aborted(capture?: (input: LLM.StreamInput) => void) {
+  return (input: LLM.StreamInput) => {
+    capture?.(input)
+    return Stream.fail(new DOMException("Aborted", "AbortError"))
   }
 }
 
@@ -435,7 +451,14 @@ function createMeasuredTurn(
   sessionID: SessionID,
   root: string,
   input: number,
-  options?: { variant?: string; format?: SessionV1.User["format"] },
+  options?: {
+    variant?: string
+    format?: SessionV1.User["format"]
+    userAgent?: string
+    assistantAgent?: string
+    error?: SessionV1.Assistant["error"]
+    toolOutput?: string
+  },
 ) {
   return Effect.gen(function* () {
     const ssn = yield* SessionNs.Service
@@ -443,7 +466,7 @@ function createMeasuredTurn(
       id: MessageID.ascending(),
       role: "user",
       sessionID,
-      agent: "build",
+      agent: options?.userAgent ?? "build",
       model: ref,
       format: options?.format,
       time: { created: Date.now() },
@@ -452,7 +475,9 @@ function createMeasuredTurn(
     const answer = yield* createAssistantMessage(sessionID, ask.id, root)
     yield* ssn.updateMessage({
       ...answer,
+      agent: options?.assistantAgent ?? answer.agent,
       variant: options?.variant,
+      error: options?.error,
       tokens: { input, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
     })
     yield* ssn.updatePart({
@@ -462,6 +487,24 @@ function createMeasuredTurn(
       type: "text",
       text: "working on it",
     })
+    if (options?.toolOutput) {
+      yield* ssn.updatePart({
+        id: PartID.ascending(),
+        messageID: answer.id,
+        sessionID,
+        type: "tool",
+        callID: "tool-call-1",
+        tool: "read",
+        state: {
+          status: "completed",
+          input: { filePath: "big.ts" },
+          output: options.toolOutput,
+          title: "big.ts",
+          metadata: {},
+          time: { start: Date.now(), end: Date.now() },
+        },
+      })
+    }
   })
 }
 
@@ -1187,7 +1230,7 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
-    "does not send again a transcript that comes out the same as the one refused as too long",
+    "shrinks past a tool-output cliff without re-sending an identical refused transcript",
     () => {
       const stub = llm()
       const requests: string[] = []
@@ -1227,11 +1270,274 @@ describe("session.compaction.process", () => {
         })
 
         expect(result).toBe("stop")
-        expect(requests).toHaveLength(2)
+        expect(requests).toHaveLength(3)
+        expect(new Set(requests).size).toBe(requests.length)
+        for (let i = 1; i < requests.length; i++) expect(requests[i].length).toBeLessThan(requests[i - 1].length)
         expect(requests[1]).toContain("characters omitted")
+        expect(requests[2]).toContain("[Tool result omitted]")
         expect(errors.count).toBe(1)
       }).pipe(withCompaction({ llm: stub.llmLayer }))
     },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "calibrates transcript size and maxOutputTokens from provider-reported overflow token counts",
+    () => {
+      const stub = llm()
+      const requests: LLM.StreamInput[] = []
+      const capture = (input: LLM.StreamInput) => requests.push(input)
+      stub.push(tooLong(capture, "prompt is too long: 160000 tokens > 20000 maximum"))
+      stub.push(reply(headed("calibrated summary"), capture))
+      const big = ProviderTest.fake({ model: createModel({ context: 1_000_000, output: 128_000 }) })
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createTurns(session.id, 12, 12_000)
+        yield* createSummaryCompaction(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const result = yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("continue")
+        expect(requests).toHaveLength(2)
+        expect(requests[0].maxOutputTokens).toBe(32_000)
+        expect(textOf(requests[1]).length).toBeLessThan(textOf(requests[0]).length / 4)
+        expect(requests[1].maxOutputTokens).toBeLessThan(20_000)
+      }).pipe(withCompaction({ llm: stub.llmLayer, provider: big, outputTokenMax: 128_000 }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "continues shrinking past a tool-output cliff on opaque 413 overflow without token counts",
+    () => {
+      const stub = llm()
+      const requests: string[] = []
+      const capture = (input: LLM.StreamInput) => requests.push(textOf(input))
+      stub.push(tooLong(capture, "Request entity too large", 413))
+      stub.push(tooLong(capture, "Request entity too large", 413))
+      stub.push(reply(headed("recovered after 413"), capture))
+      return Effect.gen(function* () {
+        const test = yield* TestInstance
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const ask = yield* createUserMessage(session.id, "inspect huge log")
+        const answer = yield* createAssistantMessage(session.id, ask.id, test.directory)
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: answer.id,
+          sessionID: session.id,
+          type: "tool",
+          callID: "huge-call",
+          tool: "read",
+          state: {
+            status: "completed",
+            input: { filePath: "huge.log" },
+            output: "h".repeat(80_000),
+            title: "huge.log",
+            metadata: {},
+            time: { start: Date.now(), end: Date.now() },
+          },
+        })
+        yield* createTurns(session.id, 6, 4_000)
+        yield* createSummaryCompaction(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const result = yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("continue")
+        expect(requests).toHaveLength(3)
+        expect(requests[1].length).toBeLessThan(requests[0].length)
+        expect(requests[2].length).toBeLessThan(requests[1].length)
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "caps live summary maxOutputTokens at 32k even with 128k outputTokenMax and keeps estimate margin",
+    () => {
+      const stub = llm()
+      const requests: LLM.StreamInput[] = []
+      stub.push(reply(headed("roomy live"), (input) => requests.push(input)))
+      stub.push(reply(headed("tight live"), (input) => requests.push(input)))
+      const million = ProviderTest.fake({ model: createModel({ context: 1_000_000, output: 128_000 }) })
+      return Effect.gen(function* () {
+        const test = yield* TestInstance
+        const ssn = yield* SessionNs.Service
+
+        const s1 = yield* ssn.create({})
+        yield* createMeasuredTurn(s1.id, test.directory, 900_000)
+        yield* createSummaryCompaction(s1.id)
+        const m1 = yield* ssn.messages({ sessionID: s1.id })
+        yield* SessionCompaction.use.process({
+          parentID: m1.at(-1)!.info.id,
+          messages: m1,
+          sessionID: s1.id,
+          auto: false,
+          live: liveRequest([]),
+        })
+
+        const s2 = yield* ssn.create({})
+        yield* createMeasuredTurn(s2.id, test.directory, 940_000, { toolOutput: "x".repeat(120_000) })
+        yield* createSummaryCompaction(s2.id)
+        const m2 = yield* ssn.messages({ sessionID: s2.id })
+        yield* SessionCompaction.use.process({
+          parentID: m2.at(-1)!.info.id,
+          messages: m2,
+          sessionID: s2.id,
+          auto: false,
+          live: liveRequest([]),
+        })
+
+        expect(requests).toHaveLength(2)
+        expect(requests[0].maxOutputTokens).toBe(32_000)
+        // 120k chars ≈ 30k estimated tokens -> 1.4x margin reserves >= 42k, leaving <= 18k of the 60k gap.
+        expect(requests[1].maxOutputTokens!).toBeLessThanOrEqual(18_000)
+        expect(requests[1].maxOutputTokens!).toBeGreaterThanOrEqual(1_024)
+      }).pipe(withCompaction({ llm: stub.llmLayer, provider: million, outputTokenMax: 128_000 }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "skips live summary on agent switch or errored anchor, stops on abort, and carries live overflow ceiling to text fallback",
+    () => {
+      const stub = llm()
+      const requests: LLM.StreamInput[] = []
+      const capture = (input: LLM.StreamInput) => requests.push(input)
+      // Case 1 (agent switch) -> text fallback
+      stub.push(reply(headed("after agent switch"), capture))
+      // Case 2 (errored anchor) -> text fallback
+      stub.push(reply(headed("after anchor error"), capture))
+      // Case 3 (aborted live) -> stops without text fallback
+      stub.push(aborted(capture))
+      // Case 4 (live overflow reports 200k ceiling on 1M model) -> text fallback caps maxOutputTokens under 200k
+      stub.push(tooLong(capture, "prompt is too long: 215000 tokens > 200000 maximum"))
+      stub.push(reply(headed("after live overflow"), capture))
+
+      const million = ProviderTest.fake({ model: createModel({ context: 1_000_000, output: 128_000 }) })
+      return Effect.gen(function* () {
+        const test = yield* TestInstance
+        const ssn = yield* SessionNs.Service
+
+        // Case 1: agent switched from plan to build
+        const calls1: Array<Parameters<SessionCompaction.Live>[0]> = []
+        const s1 = yield* ssn.create({})
+        yield* createMeasuredTurn(s1.id, test.directory, 10_000, { userAgent: "build", assistantAgent: "plan" })
+        yield* createSummaryCompaction(s1.id)
+        const m1 = yield* ssn.messages({ sessionID: s1.id })
+        const r1 = yield* SessionCompaction.use.process({
+          parentID: m1.at(-1)!.info.id,
+          messages: m1,
+          sessionID: s1.id,
+          auto: false,
+          live: liveRequest(calls1),
+        })
+        expect(r1).toBe("continue")
+        expect(calls1).toEqual([])
+
+        // Case 2: only assistant anchor had an error
+        const calls2: Array<Parameters<SessionCompaction.Live>[0]> = []
+        const s2 = yield* ssn.create({})
+        yield* createMeasuredTurn(s2.id, test.directory, 10_000, {
+          error: new NamedError.Unknown({ message: "boom" }).toObject(),
+        })
+        yield* createSummaryCompaction(s2.id)
+        const m2 = yield* ssn.messages({ sessionID: s2.id })
+        const r2 = yield* SessionCompaction.use.process({
+          parentID: m2.at(-1)!.info.id,
+          messages: m2,
+          sessionID: s2.id,
+          auto: false,
+          live: liveRequest(calls2),
+        })
+        expect(r2).toBe("continue")
+        expect(calls2).toEqual([])
+
+        // Case 3: explicit abort during live compaction does not fall back to text
+        const beforeAbort = requests.length
+        const s3 = yield* ssn.create({})
+        yield* createMeasuredTurn(s3.id, test.directory, 10_000)
+        yield* createSummaryCompaction(s3.id)
+        const m3 = yield* ssn.messages({ sessionID: s3.id })
+        const r3 = yield* SessionCompaction.use.process({
+          parentID: m3.at(-1)!.info.id,
+          messages: m3,
+          sessionID: s3.id,
+          auto: false,
+          live: liveRequest([]),
+        })
+        expect(r3).toBe("stop")
+        expect(requests.length - beforeAbort).toBe(1)
+
+        // Case 4: live overflow ceiling carries into text fallback
+        const beforeOverflow = requests.length
+        const s4 = yield* ssn.create({})
+        yield* createTurns(s4.id, 6, 120_000)
+        yield* createMeasuredTurn(s4.id, test.directory, 50_000)
+        yield* createSummaryCompaction(s4.id)
+        const m4 = yield* ssn.messages({ sessionID: s4.id })
+        const r4 = yield* SessionCompaction.use.process({
+          parentID: m4.at(-1)!.info.id,
+          messages: m4,
+          sessionID: s4.id,
+          auto: false,
+          live: liveRequest([]),
+        })
+        expect(r4).toBe("continue")
+        expect(requests.length - beforeOverflow).toBe(2)
+        // 6*120k chars (~180k est) exceeds ceiling(200_000)=170k, so fallback shortened it immediately!
+        expect(textOf(requests[beforeOverflow + 1])).toContain("characters omitted")
+      }).pipe(withCompaction({ llm: stub.llmLayer, provider: million, outputTokenMax: 128_000 }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "does not persist plan-mode reminders to SQLite when persist is false",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const first = yield* createUserMessage(session.id, "make a plan")
+        const planReply = yield* createAssistantMessage(session.id, first.id, test.directory)
+        yield* ssn.updateMessage({ ...planReply, agent: "plan" })
+        const second = yield* createUserMessage(session.id, "implement it")
+
+        const history = structuredClone(yield* ssn.messages({ sessionID: session.id }))
+        const withReminder = yield* SessionReminders.apply({
+          messages: history,
+          agent: { name: "build", mode: "primary", options: {}, permission: [] } satisfies Agent.Info,
+          session,
+          persist: false,
+        }).pipe(
+          Effect.provideService(RuntimeFlags.Service, {
+            experimentalPlanMode: true,
+            experimentalEventSystem: true,
+            experimentalNativeLlm: false,
+            client: "test",
+          } as RuntimeFlags.Info),
+          Effect.provide(AppNodeBuilder.build(FSUtil.node)),
+        )
+
+        const inMemory = withReminder.find((m) => m.info.id === second.id)
+        const stored = (yield* ssn.messages({ sessionID: session.id })).find((m) => m.info.id === second.id)
+        expect(inMemory?.parts.some((part) => part.type === "text" && part.synthetic)).toBe(true)
+        expect(stored?.parts.some((part) => part.type === "text" && part.synthetic)).toBe(false)
+      }).pipe(withCompaction()),
     { git: true },
   )
 

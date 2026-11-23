@@ -222,6 +222,13 @@ const live: Layer.Layer<
           })
         : undefined
 
+      const anthropicFixedThinkingBudget =
+        input.maxOutputTokens !== undefined &&
+        ["@ai-sdk/anthropic", "@ai-sdk/google-vertex/anthropic", "@ai-sdk/gateway"].includes(input.model.api.npm) &&
+        prepared.params.options.thinking?.type === "enabled"
+          ? (prepared.params.options.thinking.budgetTokens ?? 1024)
+          : 0
+
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.
       if (flags.experimentalNativeLlm) {
@@ -236,7 +243,10 @@ const live: Layer.Layer<
           temperature: prepared.params.temperature,
           topP: prepared.params.topP,
           topK: prepared.params.topK,
-          maxOutputTokens: prepared.params.maxOutputTokens,
+          maxOutputTokens:
+            prepared.params.maxOutputTokens !== undefined && anthropicFixedThinkingBudget > 0
+              ? Math.max(anthropicFixedThinkingBudget + 1, prepared.params.maxOutputTokens)
+              : prepared.params.maxOutputTokens,
           providerOptions: prepared.params.options,
           headers: prepared.headers,
           abort: input.abort,
@@ -318,7 +328,12 @@ const live: Layer.Layer<
           activeTools: Object.keys(prepared.tools).filter((x) => x !== "invalid"),
           tools: prepared.tools,
           toolChoice: input.toolChoice,
-          maxOutputTokens: prepared.params.maxOutputTokens,
+          // In @ai-sdk/anthropic, a fixed thinking budget is added on top of maxOutputTokens
+          // (`max_tokens = maxOutputTokens + budgetTokens`), so give up the budget while keeping max_tokens > budget.
+          maxOutputTokens:
+            prepared.params.maxOutputTokens !== undefined && anthropicFixedThinkingBudget > 0
+              ? Math.max(1, prepared.params.maxOutputTokens - anthropicFixedThinkingBudget)
+              : prepared.params.maxOutputTokens,
           abortSignal: input.abort,
           headers: prepared.headers,
           maxRetries: input.retries ?? 0,

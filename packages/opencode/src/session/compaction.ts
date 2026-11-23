@@ -35,18 +35,22 @@ export const PRUNE_PROTECT = 40_000
 const PRUNE_PROTECTED_TOOLS = ["skill"]
 const MIN_PRESERVE_RECENT_TOKENS = 2_000
 const MAX_PRESERVE_RECENT_TOKENS = 15_000
-/** After each "too long" rejection, the next summary request aims at this share of the first rejected one's size. */
-const SHRINK_STEPS = [0.85, 0.7, 0.5, 0.35]
+/** After each "too long" rejection without provider counts, the next request shrinks the refused size by this share. */
+const SHRINK_STEPS = [0.85, 0.75, 0.65, 0.5]
 /** The least of the window kept free for the summary, and the share of the window kept free when that is more. */
 const RESERVE_MIN = 16_000
 const RESERVE_SHARE = 0.15
 /** A common window size, assumed for the summary request when the model's window is unknown. */
 const UNKNOWN_WINDOW = 200_000
-/** A summary gets at least this much output, or the room left if less, even when the estimate margin leaves less. */
-const SUMMARY_OUTPUT_FLOOR = 32_000
+/** Cap summary output even when global outputTokenMax is raised (e.g. 128k), leaving headroom for live cache hits. */
+const SUMMARY_OUTPUT_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 const OUTPUT_TOKEN_MIN = 1_024
-/** Prompt text is estimated at about 4 characters per token, which can run low on dense text such as code. */
-const ESTIMATE_ERROR = 0.15
+/**
+ * `Token.estimate` uses ~4 characters per token, while dense text and code on Claude/GPT tokenizers
+ * often run ~2.8-2.9 characters per token (~1.38x).
+ */
+const ESTIMATE_ERROR = 0.4
+const MAX_OBSERVED_DENSITY = 4
 /**
  * How far one exchange of a summary transcript is shortened, in the order the levels apply: whole; tool outputs cut;
  * tool outputs left out and tool inputs cut; only the user's text, cut; omitted.
@@ -261,19 +265,91 @@ const summaryRoom = (limit: Provider.Model["limit"], output: number) =>
   Math.max(0, inputWindow(limit) - Math.min(RESERVE_MIN, output))
 
 /**
- * The output limit for a summary request of `input` tokens: the room it leaves in the window, with the margin primary
- * requests keep for a low estimate, but at least `SUMMARY_OUTPUT_FLOOR` of the room left without that margin.
+ * The output limit for a summary request of `input` tokens: capped at `SUMMARY_OUTPUT_MAX` and the remaining room
+ * in the effective context window after scaling estimated tokens by `ESTIMATE_ERROR` (or observed provider density).
  */
 const fitOutput = (
   model: Provider.Model,
   outputTokenMax: number | undefined,
-  input: { measured: number; estimated: number },
+  input: { measured: number; estimated: number; context?: number; scale?: number },
 ) => {
-  const requested = ProviderTransform.maxOutputTokens(model, outputTokenMax)
-  if (model.limit.context <= 0) return requested
-  const room = (margin: number) =>
-    Math.max(OUTPUT_TOKEN_MIN, model.limit.context - input.measured - Math.ceil(input.estimated * (1 + margin)))
-  return Math.min(requested, Math.max(room(ESTIMATE_ERROR), Math.min(SUMMARY_OUTPUT_FLOOR, room(0))))
+  const requested = Math.min(ProviderTransform.maxOutputTokens(model, outputTokenMax), SUMMARY_OUTPUT_MAX)
+  const context = input.context ?? model.limit.context
+  if (context <= 0) return requested
+  const scale = Math.max(1 + ESTIMATE_ERROR, input.scale ?? 1 + ESTIMATE_ERROR)
+  const room = Math.max(OUTPUT_TOKEN_MIN, context - input.measured - Math.ceil(input.estimated * scale))
+  return Math.min(requested, room)
+}
+
+type OverflowLimit = {
+  actual?: number
+  max: number
+}
+
+const parseCount = (raw: string) => Number(raw.replaceAll(",", ""))
+
+/** Extracts provider-reported actual and/or maximum token counts from a context-overflow error. */
+const parseOverflowLimit = (error: SessionV1.Assistant["error"]): OverflowLimit | undefined => {
+  if (!SessionV1.ContextOverflowError.isInstance(error)) return undefined
+  const text = [error.data.message, error.data.responseBody].filter(Boolean).join("\n")
+  if (!text) return undefined
+
+  // Anthropic: "input length and `max_tokens` exceed context limit: 920000 + 128000 > 1000000"
+  const sum = /exceed context limit:\s*([\d,]+)\s*\+\s*([\d,]+)\s*>\s*([\d,]+)/i.exec(text)
+  if (sum) {
+    const actual = parseCount(sum[1])
+    const max = parseCount(sum[3])
+    if (actual > 0 && max > 0) return { actual, max }
+  }
+
+  // Anthropic: "prompt is too long: 491235 tokens > 135000 maximum"
+  const gt = /([\d,]+)\s*tokens?\s*>\s*([\d,]+)\s*maximum/i.exec(text)
+  if (gt) {
+    const actual = parseCount(gt[1])
+    const max = parseCount(gt[2])
+    if (actual > 0 && max > 0) return { actual, max }
+  }
+
+  // OpenAI / vLLM: "maximum context length is 128000 tokens. However, ... resulted in / requested 145000 tokens (130000 in the messages, ...)"
+  const oai =
+    /maximum context length is\s*([\d,]+)\s*tokens[\s\S]*?(?:resulted in|requested)\s*([\d,]+)\s*tokens(?:\s*\(\s*([\d,]+)\s*in the messages)?/i.exec(
+      text,
+    )
+  if (oai) {
+    const max = parseCount(oai[1])
+    const actual = parseCount(oai[3] ?? oai[2])
+    if (actual > 0 && max > 0) return { actual, max }
+  }
+
+  // Gemini / Vertex: "input token count (150000) exceeds the maximum ... (128000)"
+  const gemini = /input token count\s*\(([\d,]+)\)[\s\S]*?maximum[^(\d]*\(?([\d,]+)\)?/i.exec(text)
+  if (gemini) {
+    const actual = parseCount(gemini[1])
+    const max = parseCount(gemini[2])
+    if (actual > 0 && max > 0) return { actual, max }
+  }
+
+  // Llama.cpp / Ollama / generic pair formats
+  const pair =
+    /(?:input\s*\(([\d,]+)\s*tokens?\)\s*is longer than[^(\d]*\(([\d,]+)\s*tokens?\)|prompt has\s*([\d,]+)\s*tokens?,\s*but the configured context size is\s*([\d,]+)\s*tokens?)/i.exec(
+      text,
+    )
+  if (pair) {
+    const actual = parseCount(pair[1] ?? pair[3])
+    const max = parseCount(pair[2] ?? pair[4])
+    if (actual > 0 && max > 0) return { actual, max }
+  }
+
+  const maxOnly =
+    /(?:maximum context length(?: of|\s+is)?\s*\(?([\d,]+)|maximum prompt length is\s*([\d,]+)|context length is only\s*([\d,]+)|with\s*([\d,]+)\s*maximum context length|exceeds the limit of\s*([\d,]+))/i.exec(
+      text,
+    )
+  if (maxOnly) {
+    const max = parseCount(maxOnly[1] ?? maxOnly[2] ?? maxOnly[3] ?? maxOnly[4] ?? maxOnly[5])
+    if (max > 0) return { max }
+  }
+
+  return undefined
 }
 
 type Turn = {
@@ -659,35 +735,54 @@ const layer = Layer.effect(
       })
       const usable = (result: SessionProcessor.Result) =>
         result === "continue" && !msg.error && msg.finish !== "tool-calls"
-      const cap = ceiling(inputWindow(model.limit) || UNKNOWN_WINDOW)
-      const output = (size: { measured: number; estimated: number }) => fitOutput(model, flags.outputTokenMax, size)
+      let effectiveContext = model.limit.context
+      let effectiveWindow = inputWindow(model.limit) || UNKNOWN_WINDOW
+      let observedScale = 1 + ESTIMATE_ERROR
+      const learnOverflow = (error: SessionV1.Assistant["error"], estimated?: number) => {
+        const limit = parseOverflowLimit(error)
+        if (!limit) return undefined
+        effectiveContext = effectiveContext > 0 ? Math.min(effectiveContext, limit.max) : limit.max
+        effectiveWindow = Math.min(effectiveWindow, limit.max)
+        if (limit.actual && estimated && estimated > 0) {
+          observedScale = Math.max(observedScale, Math.min(MAX_OBSERVED_DENSITY, (limit.actual / estimated) * 1.05))
+        }
+        return limit
+      }
+      const output = (size: { measured: number; estimated: number }) =>
+        fitOutput(model, flags.outputTokenMax, { ...size, context: effectiveContext, scale: observedScale })
 
       /**
        * The conversation exactly as the session's next turn would send it, then the summary prompt, so the unchanged
        * prefix reuses that turn's prompt cache. Only while that request is the one the latest response measured and
-       * still leaves the summary room; false, with the attempt cleared, when it is skipped or its reply is unusable.
+       * still leaves the summary room; "fallback", with the attempt cleared, when it is skipped or its reply is
+       * unusable; "error" when explicitly aborted.
        */
       const summarizeLive = Effect.fnUntraced(function* () {
-        if (!input.live || input.overflow) return false
+        if (!input.live || input.overflow) return "fallback" as const
         const user = history.findLast(
           (item) => item.info.role === "user" && !item.parts.some((part) => part.type === "compaction"),
         )?.info
-        if (user?.role !== "user" || user.format?.type === "json_schema") return false
-        if (user.model.providerID !== model.providerID || user.model.modelID !== model.id) return false
+        if (user?.role !== "user" || user.format?.type === "json_schema") return "fallback" as const
+        if (user.model.providerID !== model.providerID || user.model.modelID !== model.id) return "fallback" as const
         const anchorIndex = history.findLastIndex(
-          (item) => item.info.role === "assistant" && !item.info.summary && item.info.finish !== undefined,
+          (item) =>
+            item.info.role === "assistant" &&
+            !item.info.summary &&
+            item.info.finish !== undefined &&
+            !item.info.error,
         )
         const anchor = history[anchorIndex]
         if (
           anchor?.info.role !== "assistant" ||
           anchor.info.providerID !== model.providerID ||
           anchor.info.modelID !== model.id ||
-          anchor.info.variant !== user.model.variant
+          anchor.info.variant !== user.model.variant ||
+          anchor.info.agent !== user.agent
         )
-          return false
+          return "fallback" as const
         const tokens = anchor.info.tokens
         const prompted = tokens.input + tokens.cache.read + tokens.cache.write
-        if (prompted === 0) return false
+        if (prompted === 0) return "fallback" as const
         const prompt = [
           compacting.prompt ?? livePrompt(previousSummary !== undefined),
           TEXT_ONLY,
@@ -705,8 +800,15 @@ const layer = Layer.effect(
           estimated:
             (yield* estimate({ messages: history.slice(anchorIndex + 1), model })) + results + Token.estimate(prompt),
         }
-        const room = Math.max(cap, summaryRoom(model.limit, ProviderTransform.maxOutputTokens(model, flags.outputTokenMax)))
-        if (size.measured + size.estimated + Token.estimate(NUDGE) > room) return false
+        const room = Math.max(
+          ceiling(effectiveWindow),
+          summaryRoom(
+            model.limit,
+            Math.min(ProviderTransform.maxOutputTokens(model, flags.outputTokenMax), SUMMARY_OUTPUT_MAX),
+          ),
+        )
+        if (size.measured + Math.ceil((size.estimated + Token.estimate(NUDGE)) * observedScale) > room)
+          return "fallback" as const
 
         const id = MessageID.ascending()
         const request = yield* input.live({
@@ -728,7 +830,7 @@ const layer = Layer.effect(
             ],
           },
         })
-        if (!request) return false
+        if (!request) return "fallback" as const
         // The tools stay defined so the prefix still matches, but one the summary calls must not run.
         const tools = Object.fromEntries(
           Object.entries(request.tools).map(([name, tool]) => [name, { ...tool, execute: undefined }]),
@@ -741,21 +843,25 @@ const layer = Layer.effect(
             maxOutputTokens: output({ measured: size.measured, estimated: size.estimated + extra }),
           })
         const result = yield* send(request.messages, 0)
+        if (result === "compact") learnOverflow(msg.error)
+        if (SessionV1.AbortedError.isInstance(msg.error)) return "error" as const
         const text = yield* reply()
         if (usable(result) && text) {
-          if (compacting.prompt !== undefined || filled(text, LIVE_HEADINGS)) return true
+          if (compacting.prompt !== undefined || filled(text, LIVE_HEADINGS)) return "summarized" as const
           yield* reset()
           const nudged = yield* send(withNudge(request.messages), Token.estimate(NUDGE))
-          if (usable(nudged) && filled(yield* reply(), LIVE_HEADINGS)) return true
+          if (nudged === "compact") learnOverflow(msg.error)
+          if (SessionV1.AbortedError.isInstance(msg.error)) return "error" as const
+          if (usable(nudged) && filled(yield* reply(), LIVE_HEADINGS)) return "summarized" as const
         }
         yield* reset()
-        return false
+        return "fallback" as const
       })
 
       /**
        * The history before the retained tail as one text transcript, without tools. It is shortened to fit the window,
-       * and again, aiming at `SHRINK_STEPS` of the first rejected request's size, each time the model refuses one as
-       * too long.
+       * and again—calibrated from provider token counts when reported, or shrinking the refused size by `SHRINK_STEPS`
+       * otherwise—each time the model refuses one as too long.
        */
       const summarizeText = Effect.fnUntraced(function* () {
         const msgs = structuredClone(selected.head)
@@ -773,19 +879,19 @@ const layer = Layer.effect(
         }
         const system = Token.estimate(agent.prompt ?? "")
         const fixed = Token.estimate(promptFor("")) + system + Token.estimate(NUDGE)
-        let rejected: number | undefined
+        let target = ceiling(effectiveWindow)
         let refused: string | undefined
         for (let rejections = 0; ; ) {
-          const target = rejected === undefined ? cap : Math.floor(rejected * SHRINK_STEPS[rejections - 1])
           // Until the model refuses one as too long, a transcript that cannot be shortened enough is sent whole.
           const conversation =
             fit(renders, target - fixed, previousSummary === undefined) ??
-            (rejected === undefined ? fit(renders, Number.POSITIVE_INFINITY, false) : undefined)
+            (rejections === 0 ? fit(renders, Number.POSITIVE_INFINITY, false) : undefined)
           if (conversation === undefined) return "overflow" as const
           // The shortening goes level by level, so a smaller target can leave the refused transcript as it was.
           if (conversation === refused) {
             if (rejections === SHRINK_STEPS.length) return "overflow" as const
             rejections++
+            target = Math.floor(target * SHRINK_STEPS[rejections - 1])
             continue
           }
           const text = promptFor(conversation)
@@ -805,9 +911,17 @@ const layer = Layer.effect(
           const result = yield* send(messages, 0)
           if (result === "compact") {
             if (rejections === SHRINK_STEPS.length) return "overflow" as const
-            rejected ??= estimated
+            const limit = learnOverflow(msg.error, estimated)
             refused = conversation
             rejections++
+            const blind = Math.floor(estimated * SHRINK_STEPS[rejections - 1])
+            const calibrated =
+              limit?.actual !== undefined
+                ? Math.floor(estimated * (ceiling(limit.max) / limit.actual) * 0.92)
+                : limit !== undefined
+                  ? Math.floor(ceiling(limit.max) / observedScale)
+                  : undefined
+            target = calibrated !== undefined ? Math.min(blind, calibrated) : blind
             yield* reset()
             continue
           }
@@ -830,7 +944,8 @@ const layer = Layer.effect(
         }
       })
 
-      const outcome = (yield* summarizeLive()) ? ("summarized" as const) : yield* summarizeText()
+      const liveOutcome = yield* summarizeLive()
+      const outcome = liveOutcome === "fallback" ? yield* summarizeText() : liveOutcome
       if (outcome !== "summarized") {
         if (outcome === "overflow") {
           msg.error = new SessionV1.ContextOverflowError({

@@ -2281,6 +2281,84 @@ describe("session.llm.stream", () => {
     { config: anthropicConfig("claude-opus-4-6") },
   )
 
+  it.instance(
+    "does not re-inject max_output_tokens when a plugin clears it (OpenAI Codex)",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const request = waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              {
+                type: "response.created",
+                response: { id: "resp-codex-limit", created_at: Math.floor(Date.now() / 1000), model: model.id },
+              },
+              {
+                type: "response.output_item.added",
+                output_index: 0,
+                item: { id: "msg_1", type: "message", status: "in_progress", role: "assistant", content: [] },
+              },
+              {
+                type: "response.content_part.added",
+                item_id: "msg_1",
+                output_index: 0,
+                content_index: 0,
+                part: { type: "output_text", text: "" },
+              },
+              {
+                type: "response.output_text.delta",
+                item_id: "msg_1",
+                output_index: 0,
+                content_index: 0,
+                delta: "ok",
+              },
+              {
+                type: "response.completed",
+                response: {
+                  id: "resp-codex-limit",
+                  created_at: Math.floor(Date.now() / 1000),
+                  model: model.id,
+                  usage: { input_tokens: 3, output_tokens: 2, total_tokens: 5 },
+                },
+              },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const sessionID = SessionID.make("session-test-codex-output-limit")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        yield* drain({
+          user: {
+            id: MessageID.make("msg_user-codex-output-limit"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.openai, modelID: resolved.id },
+          } satisfies SessionV1.User,
+          sessionID,
+          model: resolved,
+          agent,
+          system: [],
+          messages: [{ role: "user", content: "Hello" }],
+          tools: {},
+          maxOutputTokens: 16_000,
+        })
+
+        const capture = yield* Effect.promise(() => request)
+        expect(capture.body.max_output_tokens).toBe(undefined)
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
   const geminiFixture = { providerID: "google", modelID: "gemini-2.5-flash" }
   it.instance(
     "sends Google API payload for Gemini models",

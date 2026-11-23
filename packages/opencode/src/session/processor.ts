@@ -627,8 +627,8 @@ const layer = Layer.effect(
         const error = parse(e)
         // A failed summary attempt is retried or recorded by compaction, which reports the outcome once.
         if (ctx.assistantMessage.summary && !aborted) {
+          ctx.assistantMessage.error = error
           if (SessionV1.ContextOverflowError.isInstance(error)) ctx.needsCompaction = true
-          else ctx.assistantMessage.error = error
           return
         }
         if (SessionV1.ContextOverflowError.isInstance(error)) {

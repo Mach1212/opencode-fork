@@ -1093,6 +1093,7 @@ const layer = Layer.effect(
         messages: input.messages,
         agent: input.agent,
         session: input.session,
+        persist: input.prompt === undefined,
       }).pipe(
         Effect.provideService(RuntimeFlags.Service, flags),
         Effect.provideService(FSUtil.Service, fsys),
