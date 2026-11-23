@@ -1187,6 +1187,55 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
+    "does not send again a transcript that comes out the same as the one refused as too long",
+    () => {
+      const stub = llm()
+      const requests: string[] = []
+      for (let i = 0; i < 5; i++) stub.push(tooLong((input) => requests.push(textOf(input))))
+      return Effect.gen(function* () {
+        const test = yield* TestInstance
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const errors = yield* countErrors(session.id)
+        const ask = yield* createUserMessage(session.id, "read the log")
+        const answer = yield* createAssistantMessage(session.id, ask.id, test.directory)
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: answer.id,
+          sessionID: session.id,
+          type: "tool",
+          callID: "read-call",
+          tool: "read",
+          state: {
+            status: "completed",
+            input: { filePath: "log.txt" },
+            output: "o".repeat(40_000),
+            title: "log.txt",
+            metadata: {},
+            time: { start: Date.now(), end: Date.now() },
+          },
+        })
+        yield* createUserMessage(session.id, "now what")
+        yield* createSummaryCompaction(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const result = yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("stop")
+        expect(requests).toHaveLength(2)
+        expect(requests[1]).toContain("characters omitted")
+        expect(errors.count).toBe(1)
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
     "clears a refused attempt's partial reply before sending a shorter one",
     () => {
       const stub = llm()

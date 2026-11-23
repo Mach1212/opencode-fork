@@ -774,6 +774,7 @@ const layer = Layer.effect(
         const system = Token.estimate(agent.prompt ?? "")
         const fixed = Token.estimate(promptFor("")) + system + Token.estimate(NUDGE)
         let rejected: number | undefined
+        let refused: string | undefined
         for (let rejections = 0; ; ) {
           const target = rejected === undefined ? cap : Math.floor(rejected * SHRINK_STEPS[rejections - 1])
           // Until the model refuses one as too long, a transcript that cannot be shortened enough is sent whole.
@@ -781,6 +782,12 @@ const layer = Layer.effect(
             fit(renders, target - fixed, previousSummary === undefined) ??
             (rejected === undefined ? fit(renders, Number.POSITIVE_INFINITY, false) : undefined)
           if (conversation === undefined) return "overflow" as const
+          // The shortening goes level by level, so a smaller target can leave the refused transcript as it was.
+          if (conversation === refused) {
+            if (rejections === SHRINK_STEPS.length) return "overflow" as const
+            rejections++
+            continue
+          }
           const text = promptFor(conversation)
           const estimated = Token.estimate(text) + system
           const messages: ModelMessage[] = [{ role: "user", content: [{ type: "text", text }] }]
@@ -799,6 +806,7 @@ const layer = Layer.effect(
           if (result === "compact") {
             if (rejections === SHRINK_STEPS.length) return "overflow" as const
             rejected ??= estimated
+            refused = conversation
             rejections++
             yield* reset()
             continue
