@@ -31,6 +31,8 @@ const TOOL_OUTPUT_MAX_CHARS = 2_000
 const PRUNE_PROTECTED_TOOLS = ["skill"]
 const MIN_PRESERVE_RECENT_TOKENS = 2_000
 const MAX_PRESERVE_RECENT_TOKENS = 15_000
+const SUMMARY_RETRIES = 3
+const HISTORY_CUT = "[The start of the conversation is left out here: all of it was too long to summarize.]"
 type Turn = {
   start: number
   end: number
@@ -63,10 +65,11 @@ const serialize = (message: SessionV1.WithParts) => {
     )
     return [...(text ? [`[User]: ${text}`] : []), ...files].join("\n")
   }
+  // The model's reasoning stays out: the provider drops it from the conversation's own requests,
+  // so it would make the summary request larger than the context it summarizes.
   return message.parts
     .flatMap((part) => {
       if (part.type === "text") return part.text ? [`[Assistant]: ${part.text}`] : []
-      if (part.type === "reasoning") return part.text ? [`[Assistant reasoning]: ${part.text}`] : []
       if (part.type !== "tool") return []
       const call = `[Assistant tool call]: ${part.tool}(${JSON.stringify(part.state.input)})`
       if (part.state.status === "completed") {
@@ -82,6 +85,14 @@ const serialize = (message: SessionV1.WithParts) => {
       return [call]
     })
     .join("\n")
+}
+
+// At least one entry goes, and at least one stays.
+function oldestQuarter(entries: string[]) {
+  const total = entries.reduce((sum, entry) => sum + entry.length, 0)
+  let count = 0
+  for (let dropped = 0; count < entries.length - 1 && dropped < total / 4; count++) dropped += entries[count].length
+  return count
 }
 
 function summaryText(message: SessionV1.WithParts) {
@@ -377,18 +388,7 @@ const layer = Layer.effect(
       )
       const msgs = structuredClone(selected.head)
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-      const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
-      const nextPrompt =
-        compacting.prompt ??
-        [
-          buildPrompt({
-            previousSummary,
-            context: [conversation],
-          }),
-          ...compacting.context,
-        ]
-          .filter(Boolean)
-          .join("\n\n")
+      const entries = msgs.map(serialize).filter(Boolean)
       const ctx = yield* InstanceState.context
       const msg: SessionV1.Assistant = {
         id: MessageID.ascending(),
@@ -422,30 +422,50 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         model,
       })
-      const result = yield* processor.process({
-        user: userMessage,
-        agent,
-        sessionID: input.sessionID,
-        tools: {},
-        system: [],
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: [
-                  nextPrompt,
-                  ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
-                ]
-                  .filter(Boolean)
-                  .join("\n\n"),
-              },
-            ],
-          },
-        ],
-        model,
-      })
+      const summarize = (conversation: string) => {
+        const nextPrompt =
+          compacting.prompt ??
+          [
+            buildPrompt({
+              previousSummary,
+              context: [conversation],
+            }),
+            ...compacting.context,
+          ]
+            .filter(Boolean)
+            .join("\n\n")
+        return processor.process({
+          user: userMessage,
+          agent,
+          sessionID: input.sessionID,
+          tools: {},
+          system: [],
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: [
+                    nextPrompt,
+                    ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
+                  ]
+                    .filter(Boolean)
+                    .join("\n\n"),
+                },
+              ],
+            },
+          ],
+          model,
+        })
+      }
+      let result = yield* summarize(entries.join("\n\n"))
+      // Too long for the model: the oldest history goes first, as the summary must carry the recent work.
+      let start = 0
+      for (let retry = 0; result === "compact" && retry < SUMMARY_RETRIES && entries.length - start > 1; retry++) {
+        start += oldestQuarter(entries.slice(start))
+        result = yield* summarize([HISTORY_CUT, ...entries.slice(start)].join("\n\n"))
+      }
 
       if (result === "compact") {
         processor.message.error = new SessionV1.ContextOverflowError({

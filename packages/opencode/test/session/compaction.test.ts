@@ -337,6 +337,31 @@ function reply(
   }
 }
 
+function tooLong(capture?: (input: LLM.StreamInput) => void) {
+  const message = "prompt is too long: 1037248 tokens > 1000000 maximum"
+  return (input: LLM.StreamInput) => {
+    capture?.(input)
+    return Stream.fail(
+      new APICallError({
+        message,
+        url: "https://example.com/v1/messages",
+        requestBodyValues: {},
+        statusCode: 400,
+        responseHeaders: { "content-type": "application/json" },
+        responseBody: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }),
+        isRetryable: false,
+      }),
+    )
+  }
+}
+
+function createTurns(sessionID: SessionID, count: number) {
+  return Effect.forEach(
+    Array.from({ length: count }, (_, index) => index + 1),
+    (turn) => createUserMessage(sessionID, `turn-${turn} ${"x".repeat(100)}`),
+  )
+}
+
 function plugin(ready: Deferred.Deferred<void>) {
   return Layer.mock(Plugin.Service)({
     trigger: <Name extends string, Input, Output>(name: Name, _input: Input, output: Output) => {
@@ -902,6 +927,125 @@ describe("session.compaction.process", () => {
         expect(JSON.stringify(summary.info.error)).toContain("Session too large to compact")
       }
     }).pipe(withCompaction({ result: "compact" })),
+  )
+
+  itCompaction.instance(
+    "leaves the model's reasoning out of the summary request",
+    () => {
+      const stub = llm()
+      let captured = ""
+      stub.push(reply("summary", (input) => (captured = JSON.stringify(input.messages))))
+      return Effect.gen(function* () {
+        const test = yield* TestInstance
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const ask = yield* createUserMessage(session.id, "question")
+        const answer = yield* createAssistantMessage(session.id, ask.id, test.directory)
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: answer.id,
+          sessionID: session.id,
+          type: "reasoning",
+          text: "private-thoughts",
+          time: { start: Date.now(), end: Date.now() },
+        })
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: answer.id,
+          sessionID: session.id,
+          type: "text",
+          text: "visible-answer",
+        })
+        yield* createSummaryCompaction(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(captured).toContain("visible-answer")
+        expect(captured).not.toContain("private-thoughts")
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "sends a summary request the model refuses as too long again without the oldest history",
+    () => {
+      const stub = llm()
+      const requests: string[] = []
+      const capture = (input: LLM.StreamInput) => requests.push(JSON.stringify(input.messages))
+      stub.push(tooLong(capture))
+      stub.push(reply("summary", capture))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createTurns(session.id, 4)
+        yield* createSummaryCompaction(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const result = yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+        const summaries = (yield* ssn.messages({ sessionID: session.id })).filter(
+          (msg) => msg.info.role === "assistant" && msg.info.summary,
+        )
+
+        expect(result).toBe("continue")
+        expect(requests).toHaveLength(2)
+        expect(requests[0]).toContain("turn-1")
+        expect(requests[1]).not.toContain("turn-1")
+        for (const turn of [2, 3, 4]) expect(requests[1]).toContain(`turn-${turn}`)
+        expect(summaries).toHaveLength(1)
+        const summary = summaries[0]
+        expect(summary.info.role === "assistant" && summary.info.error).toBeUndefined()
+        expect(summary.parts.some((part) => part.type === "text" && part.text === "summary")).toBe(true)
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "stops after three shorter summary requests the model refuses as too long",
+    () => {
+      const stub = llm()
+      const requests: string[] = []
+      for (let i = 0; i < 5; i++) stub.push(tooLong((input) => requests.push(JSON.stringify(input.messages))))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createTurns(session.id, 4)
+        yield* createSummaryCompaction(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const result = yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+        const summaries = (yield* ssn.messages({ sessionID: session.id })).filter(
+          (msg) => msg.info.role === "assistant" && msg.info.summary,
+        )
+
+        expect(result).toBe("stop")
+        expect(requests).toHaveLength(4)
+        expect(requests[3]).toContain("turn-4")
+        for (const turn of [1, 2, 3]) expect(requests[3]).not.toContain(`turn-${turn}`)
+        expect(summaries).toHaveLength(1)
+        const summary = summaries[0].info
+        expect(summary.role === "assistant" && summary.finish).toBe("error")
+        expect(summary.role === "assistant" && summary.error?.name).toBe("ContextOverflowError")
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
   )
 
   it.instance(
