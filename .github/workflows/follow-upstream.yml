@@ -1,0 +1,139 @@
+name: Follow upstream's OpenCode 1.x releases
+
+# When upstream has a stable 1.x release that this fork has not built with its current
+# changes, build it (build.sh) and publish it as a release here.
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream release to build, such as v1.19.6. Empty: its newest stable 1.x release."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: follow-upstream
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  UPSTREAM: anomalyco/opencode
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Which release, and whether it is on record already
+        id: plan
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # Upstream's latest release is 2.x: the newest 1.x release is found among them all.
+          newest=$(gh api "repos/$UPSTREAM/releases?per_page=100" --paginate |
+            jq -r '.[] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^v1\\.[0-9]+\\.[0-9]+$"))' |
+            sort -V | tail -n 1)
+          tag=${TAG_INPUT:-$newest}
+          [[ $tag =~ ^v1\.[0-9]+\.[0-9]+$ ]] || { echo "Expected an OpenCode 1.x release tag: $tag" >&2; exit 1; }
+          # A build is made of the release, the patches and the recipe.
+          key=$(git rev-parse HEAD:patches HEAD:build.sh | sha256sum | cut -c1-16)
+          builds=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate |
+            jq -r --arg prefix "$tag-t3kube." --arg key "build-key: $key" '
+              .[] | select(.tag_name | startswith($prefix)) |
+              (.tag_name | ltrimstr($prefix) | select(test("^[0-9]+$"))) as $number |
+              "\($number) \((.body // "") | split("\n") | index($key) != null)"')
+          if grep -q ' true$' <<< "$builds"; then
+            echo "$tag is on record with these patches and recipe: built, or tried and failed."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          last=$(cut -d ' ' -f 1 <<< "$builds" | sort -n | tail -n 1)
+          package=$(curl -fsSL "https://raw.githubusercontent.com/$UPSTREAM/$tag/package.json")
+          bun=$(jq -er '.packageManager | capture("^bun@(?<version>[^+]+)").version' <<< "$package")
+          {
+            echo "build=true"
+            echo "tag=$tag"
+            echo "name=$tag-t3kube.$((${last:-0} + 1))"
+            echo "key=$key"
+            echo "latest=$([ "$tag" = "$newest" ] && echo true || echo false)"
+            echo "bun=$bun"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Node for native dependencies
+        if: steps.plan.outputs.build == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Bun, the version the release names
+        if: steps.plan.outputs.build == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ steps.plan.outputs.bun }}
+
+      - name: Build
+        id: build
+        if: steps.plan.outputs.build == 'true'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set +e
+          ./build.sh "$TAG" out
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      # A build that does not stand fails this run once. The draft keeps later runs from
+      # trying it again until patches/ or build.sh changes. The issue notifies the owner,
+      # who is assigned to it. Earlier builds stay as they are.
+      - name: Remember a release that does not stand
+        if: failure() && steps.build.outputs.code != ''
+        env:
+          NAME: ${{ steps.plan.outputs.name }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          KEY: ${{ steps.plan.outputs.key }}
+          CODE: ${{ steps.build.outputs.code }}
+        run: |
+          set -euo pipefail
+          run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          if [ "$CODE" = 3 ]; then why="a patch does not fit"; else why="the build fails"; fi
+          gh release create "$NAME" --draft --target "$GITHUB_SHA" \
+            --title "OpenCode ${TAG#v}: $why" \
+            --notes "No build: $why with upstream's $TAG. The run that says which: $run
+
+          build-key: $KEY"
+          gh issue create --assignee "$GITHUB_REPOSITORY_OWNER" \
+            --title "Upstream $TAG was not built: $why" \
+            --body "There is no build for upstream's \`$TAG\`: $why. The run: $run
+
+          Earlier builds stay as they are. When \`patches/\` or \`build.sh\` changes, the workflow tries \`$TAG\` (or the newest upstream 1.x release by then) again." ||
+            echo "::warning::the issue could not be opened"
+
+      - name: Publish
+        if: steps.plan.outputs.build == 'true'
+        env:
+          NAME: ${{ steps.plan.outputs.name }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          KEY: ${{ steps.plan.outputs.key }}
+          LATEST: ${{ steps.plan.outputs.latest }}
+        run: |
+          set -euo pipefail
+          printf '\nbuild-key: %s\n' "$KEY" >> out/notes.md
+          gh release create "$NAME" out/opencode-linux-x64-baseline.tar.gz out/SHA256SUMS --target "$GITHUB_SHA" \
+            --title "OpenCode ${TAG#v}, build ${NAME##*.}" --notes-file out/notes.md --latest="$LATEST"
+          # The list of builds; its commits also keep GitHub from switching the schedule off.
+          echo "- $(date -u +%F) [$NAME]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$NAME)" >> builds.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add builds.md
+          git commit --quiet -m "build $NAME"
+          git pull --quiet --rebase
+          git push --quiet
