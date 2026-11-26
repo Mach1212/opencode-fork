@@ -1,5 +1,5 @@
 diff --git a/packages/opencode/src/session/compaction.ts b/packages/opencode/src/session/compaction.ts
-index 75d6374..cc96489 100644
+index 75d6374..59ee48a 100644
 --- a/packages/opencode/src/session/compaction.ts
 +++ b/packages/opencode/src/session/compaction.ts
 @@ -1,12 +1,17 @@
@@ -20,7 +20,7 @@ index 75d6374..cc96489 100644
  import { Agent } from "@/agent/agent"
  import { Plugin } from "@/plugin"
  import { Config } from "@/config/config"
-@@ -27,63 +32,343 @@ export const Event = SessionCompactionEvent
+@@ -27,63 +32,342 @@ export const Event = SessionCompactionEvent
  
  export const PRUNE_MINIMUM = 20_000
  export const PRUNE_PROTECT = 40_000
@@ -40,8 +40,6 @@ index 75d6374..cc96489 100644
 +const RESERVE_SHARE = 0.15
 +/** A common window size, assumed for the summary request when the model's window is unknown. */
 +const UNKNOWN_WINDOW = 200_000
-+/** Cap summary output even when global outputTokenMax is raised (e.g. 128k), leaving headroom for live cache hits. */
-+const SUMMARY_OUTPUT_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 +const OUTPUT_TOKEN_MIN = 1_024
 +/**
 + * `Token.estimate` uses ~4 characters per token, while dense text and code on Claude/GPT tokenizers
@@ -279,15 +277,16 @@ index 75d6374..cc96489 100644
 +  Math.max(0, inputWindow(limit) - Math.min(RESERVE_MIN, output))
 +
 +/**
-+ * The output limit for a summary request of `input` tokens: capped at `SUMMARY_OUTPUT_MAX` and the remaining room
++ * The output limit for a summary request of `input` tokens: the model's own, lowered to the room the request leaves
 + * in the effective context window after scaling estimated tokens by `ESTIMATE_ERROR` (or observed provider density).
++ * Thinking counts against the limit, so a fixed cap below that room can end a summary before it has written a word.
 + */
 +const fitOutput = (
 +  model: Provider.Model,
 +  outputTokenMax: number | undefined,
 +  input: { measured: number; estimated: number; context?: number; scale?: number },
 +) => {
-+  const requested = Math.min(ProviderTransform.maxOutputTokens(model, outputTokenMax), SUMMARY_OUTPUT_MAX)
++  const requested = ProviderTransform.maxOutputTokens(model, outputTokenMax)
 +  const context = input.context ?? model.limit.context
 +  if (context <= 0) return requested
 +  const scale = Math.max(1 + ESTIMATE_ERROR, input.scale ?? 1 + ESTIMATE_ERROR)
@@ -386,7 +385,7 @@ index 75d6374..cc96489 100644
  function summaryText(message: SessionV1.WithParts) {
    const text = message.parts
      .filter((part): part is SessionV1.TextPart => part.type === "text")
-@@ -162,6 +447,18 @@ function splitTurn(input: {
+@@ -162,6 +446,18 @@ function splitTurn(input: {
    })
  }
  
@@ -405,7 +404,7 @@ index 75d6374..cc96489 100644
  export interface Interface {
    readonly isOverflow: (input: {
      tokens: SessionV1.Assistant["tokens"]
-@@ -174,6 +471,7 @@ export interface Interface {
+@@ -174,6 +470,7 @@ export interface Interface {
      sessionID: SessionID
      auto: boolean
      overflow?: boolean
@@ -413,7 +412,7 @@ index 75d6374..cc96489 100644
    }) => Effect.Effect<"continue" | "stop">
    readonly create: (input: {
      sessionID: SessionID
-@@ -199,6 +497,7 @@ const layer = Layer.effect(
+@@ -199,6 +496,7 @@ const layer = Layer.effect(
      const provider = yield* Provider.Service
      const events = yield* EventV2Bridge.Service
      const flags = yield* RuntimeFlags.Service
@@ -421,7 +420,7 @@ index 75d6374..cc96489 100644
  
      const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
        tokens: SessionV1.Assistant["tokens"]
-@@ -216,7 +515,14 @@ const layer = Layer.effect(
+@@ -216,7 +514,14 @@ const layer = Layer.effect(
        messages: SessionV1.WithParts[]
        model: Provider.Model
      }) {
@@ -437,7 +436,7 @@ index 75d6374..cc96489 100644
        return Token.estimate(JSON.stringify(msgs))
      })
  
-@@ -322,6 +628,7 @@ const layer = Layer.effect(
+@@ -322,6 +627,7 @@ const layer = Layer.effect(
        sessionID: SessionID
        auto: boolean
        overflow?: boolean
@@ -445,7 +444,7 @@ index 75d6374..cc96489 100644
      }) {
        const parent = input.messages.findLast((m) => m.info.id === input.parentID)
        if (!parent || parent.info.role !== "user") {
-@@ -356,9 +663,12 @@ const layer = Layer.effect(
+@@ -356,9 +662,12 @@ const layer = Layer.effect(
        }
  
        const agent = yield* agents.get("compaction")
@@ -459,7 +458,7 @@ index 75d6374..cc96489 100644
        const cfg = yield* config.get()
        const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
        const prior = completedCompactions(history)
-@@ -367,7 +677,8 @@ const layer = Layer.effect(
+@@ -367,7 +676,8 @@ const layer = Layer.effect(
        const selected = yield* select({
          messages: history.filter((_, index) => !hidden.has(index)),
          cfg,
@@ -469,7 +468,7 @@ index 75d6374..cc96489 100644
        })
        // Allow plugins to inject context or replace compaction prompt.
        const compacting = yield* plugin.trigger(
-@@ -375,20 +686,6 @@ const layer = Layer.effect(
+@@ -375,20 +685,6 @@ const layer = Layer.effect(
          { sessionID: input.sessionID },
          { context: [], prompt: undefined },
        )
@@ -490,7 +489,7 @@ index 75d6374..cc96489 100644
        const ctx = yield* InstanceState.context
        const msg: SessionV1.Assistant = {
          id: MessageID.ascending(),
-@@ -422,40 +719,251 @@ const layer = Layer.effect(
+@@ -422,40 +718,260 @@ const layer = Layer.effect(
          sessionID: input.sessionID,
          model,
        })
@@ -527,8 +526,9 @@ index 75d6374..cc96489 100644
 +        msg.time.completed = undefined
 +        yield* session.updateMessage(msg)
 +      })
++      // A reply that ran out of output tokens is not a summary: thinking may have used them all, or the text stops short.
 +      const usable = (result: SessionProcessor.Result) =>
-+        result === "continue" && !msg.error && msg.finish !== "tool-calls"
++        result === "continue" && !msg.error && msg.finish !== "tool-calls" && msg.finish !== "length"
 +      let effectiveContext = model.limit.context
 +      let effectiveWindow = inputWindow(model.limit) || UNKNOWN_WINDOW
 +      let observedScale = 1 + ESTIMATE_ERROR
@@ -596,10 +596,7 @@ index 75d6374..cc96489 100644
 +        }
 +        const room = Math.max(
 +          ceiling(effectiveWindow),
-+          summaryRoom(
-+            model.limit,
-+            Math.min(ProviderTransform.maxOutputTokens(model, flags.outputTokenMax), SUMMARY_OUTPUT_MAX),
-+          ),
++          summaryRoom(model.limit, ProviderTransform.maxOutputTokens(model, flags.outputTokenMax)),
 +        )
 +        if (size.measured + Math.ceil((size.estimated + Token.estimate(NUDGE)) * observedScale) > room)
 +          return "fallback" as const
@@ -731,9 +728,12 @@ index 75d6374..cc96489 100644
 +            continue
 +          }
 +          if (msg.finish === "tool-calls") return "tool-calls" as const
++          if (!msg.error && msg.finish === "length") return "cut-off" as const
 +          if (!usable(result)) return "error" as const
 +          const first = yield* reply()
-+          if (!first || compacting.prompt !== undefined || filled(first, TEXT_HEADINGS)) return "summarized" as const
++          // Kept as a summary, either would stand in for the whole history; failed, the next turn asks again.
++          if (!first) return "empty" as const
++          if (compacting.prompt !== undefined || filled(first, TEXT_HEADINGS)) return "summarized" as const
 +          // One reminder; if it does not help, the first summary is kept rather than none at all.
 +          const kept = { parts: yield* parts(), finish: msg.finish, tokens: msg.tokens }
 +          yield* reset()
@@ -764,6 +764,14 @@ index 75d6374..cc96489 100644
 +            message: "Compaction failed: the model called a tool instead of writing the summary",
 +          }).toObject()
 +        }
++        if (outcome === "cut-off") {
++          msg.error = new NamedError.Unknown({
++            message: "Compaction failed: the summary ran out of output tokens",
++          }).toObject()
++        }
++        if (outcome === "empty") {
++          msg.error = new NamedError.Unknown({ message: "Compaction failed: the model wrote no summary" }).toObject()
++        }
 +        if (outcome !== "error") msg.finish = "error"
 +        msg.time.completed ??= Date.now()
 +        yield* session.updateMessage(msg)
@@ -772,7 +780,7 @@ index 75d6374..cc96489 100644
        }
  
        if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
-@@ -465,7 +973,7 @@ const layer = Layer.effect(
+@@ -465,7 +981,7 @@ const layer = Layer.effect(
          })
        }
  
@@ -781,7 +789,7 @@ index 75d6374..cc96489 100644
          if (replay) {
            const original = replay.info
            const replayMsg = yield* session.updateMessage({
-@@ -549,11 +1057,8 @@ const layer = Layer.effect(
+@@ -549,11 +1065,8 @@ const layer = Layer.effect(
          }
        }
  
@@ -795,7 +803,7 @@ index 75d6374..cc96489 100644
      })
  
      const create = Effect.fn("SessionCompaction.create")(function* (input: {
-@@ -602,6 +1107,7 @@ export const node = LayerNode.make({
+@@ -602,6 +1115,7 @@ export const node = LayerNode.make({
      Provider.node,
      EventV2Bridge.node,
      RuntimeFlags.node,
@@ -1226,7 +1234,7 @@ index f5484b8..616abab 100644
    return input.messages
  })
 diff --git a/packages/opencode/test/session/compaction.test.ts b/packages/opencode/test/session/compaction.test.ts
-index c76dd98..0d7e70d 100644
+index c76dd98..aac67f1 100644
 --- a/packages/opencode/test/session/compaction.test.ts
 +++ b/packages/opencode/test/session/compaction.test.ts
 @@ -2,13 +2,18 @@ import { afterEach, describe, expect, mock, test } from "bun:test"
@@ -1249,8 +1257,54 @@ index c76dd98..0d7e70d 100644
  import { Token } from "@/util/token"
  import { Plugin } from "../../src/plugin"
  import { provideTmpdirInstance, TestInstance } from "../fixture/fixture"
-@@ -217,9 +222,18 @@ function processorLayer(result: "continue" | "compact") {
-   )
+@@ -196,6 +201,7 @@ function createCompactionMarker(sessionID: SessionID) {
+ function fake(
+   input: Parameters<SessionProcessorModule.SessionProcessor.Interface["create"]>[0],
+   result: "continue" | "compact",
++  ssn: SessionNs.Interface,
+ ) {
+   const msg = input.assistantMessage
+   return {
+@@ -204,22 +210,48 @@ function fake(
+     },
+     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
+     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
+-    process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
++    process: Effect.fn("TestSessionProcessor.process")(function* () {
++      if (result === "continue")
++        yield* ssn.updatePart({
++          id: PartID.ascending(),
++          messageID: msg.id,
++          sessionID: msg.sessionID,
++          type: "text",
++          text: headed("summary"),
++        })
++      return result
++    }),
+   } satisfies SessionProcessorModule.SessionProcessor.Handle
+ }
+ 
+-function processorLayer(result: "continue" | "compact") {
+-  return Layer.succeed(
+-    SessionProcessorModule.SessionProcessor.Service,
+-    SessionProcessorModule.SessionProcessor.Service.of({
+-      create: Effect.fn("TestSessionProcessor.create")((input) => Effect.succeed(fake(input, result))),
+-    }),
+-  )
++function processorNode(result: "continue" | "compact") {
++  return LayerNode.make({
++    service: SessionProcessorModule.SessionProcessor.Service,
++    layer: Layer.effect(
++      SessionProcessorModule.SessionProcessor.Service,
++      Effect.gen(function* () {
++        const ssn = yield* SessionNs.Service
++        return SessionProcessorModule.SessionProcessor.Service.of({
++          create: Effect.fn("TestSessionProcessor.create")((input) => Effect.succeed(fake(input, result, ssn))),
++        })
++      }),
++    ),
++    deps: [SessionNs.node],
++  })
  }
  
 -function cfg(compaction?: ConfigV1.Info["compaction"]) {
@@ -1270,7 +1324,16 @@ index c76dd98..0d7e70d 100644
  }
  
  const defaultProvider = wide()
-@@ -250,6 +264,7 @@ type CompactionProcessOptions = {
+@@ -233,7 +265,7 @@ const compactionTestNode = LayerNode.group([
+ ])
+ const env = AppNodeBuilder.build(compactionTestNode, [
+   [Provider.node, defaultProvider.layer],
+-  [SessionProcessorModule.SessionProcessor.node, processorLayer("continue")],
++  [SessionProcessorModule.SessionProcessor.node, processorNode("continue")],
+   [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
+ ])
+ 
+@@ -250,6 +282,7 @@ type CompactionProcessOptions = {
    plugin?: Layer.Layer<Plugin.Service>
    provider?: ReturnType<typeof wide>
    config?: Layer.Layer<Config.Service>
@@ -1278,7 +1341,7 @@ index c76dd98..0d7e70d 100644
  }
  
  function withCompaction(options?: CompactionProcessOptions) {
-@@ -259,7 +274,13 @@ function withCompaction(options?: CompactionProcessOptions) {
+@@ -259,13 +292,19 @@ function withCompaction(options?: CompactionProcessOptions) {
  function compactionProcessLayer(options?: CompactionProcessOptions) {
    const replacements: LayerNode.Replacements = [
      [Provider.node, (options?.provider ?? wide()).layer],
@@ -1293,7 +1356,14 @@ index c76dd98..0d7e70d 100644
      [SessionSummary.node, summary],
    ]
    if (!options?.llm) {
-@@ -337,6 +358,177 @@ function reply(
+     return AppNodeBuilder.build(compactionTestNode, [
+       ...replacements,
+-      [SessionProcessorModule.SessionProcessor.node, processorLayer(options?.result ?? "continue")],
++      [SessionProcessorModule.SessionProcessor.node, processorNode(options?.result ?? "continue")],
+       ...(options?.plugin ? ([[Plugin.node, options.plugin]] as const) : []),
+       ...(options?.config ? ([[Config.node, options.config]] as const) : []),
+     ])
+@@ -337,6 +376,190 @@ function reply(
    }
  }
  
@@ -1356,6 +1426,19 @@ index c76dd98..0d7e70d 100644
 +}
 +
 +const headed = (text: string) => `## Objective\n- ${text}`
++
++function cutOff(capture?: (input: LLM.StreamInput) => void) {
++  return (input: LLM.StreamInput) => {
++    capture?.(input)
++    return Stream.make(
++      LLMEvent.textStart({ id: "txt-0" }),
++      LLMEvent.textDelta({ id: "txt-0", text: headed("cut off he") }),
++      LLMEvent.textEnd({ id: "txt-0" }),
++      LLMEvent.stepFinish({ index: 0, reason: "length", usage: basicUsage() }),
++      LLMEvent.finish({ reason: "length", usage: basicUsage() }),
++    )
++  }
++}
 +
 +const textOf = (input: LLM.StreamInput) => JSON.stringify(input.messages)
 +
@@ -1471,7 +1554,7 @@ index c76dd98..0d7e70d 100644
  function plugin(ready: Deferred.Deferred<void>) {
    return Layer.mock(Plugin.Service)({
      trigger: <Name extends string, Input, Output>(name: Name, _input: Input, output: Output) => {
-@@ -365,6 +557,20 @@ function autocontinue(enabled: boolean) {
+@@ -365,6 +588,20 @@ function autocontinue(enabled: boolean) {
    })
  }
  
@@ -1492,20 +1575,106 @@ index c76dd98..0d7e70d 100644
  function compactionContext(context: string) {
    return Layer.mock(Plugin.Service)({
      trigger: <Name extends string, Input, Output>(name: Name, _input: Input, output: Output) => {
-@@ -904,6 +1110,762 @@ describe("session.compaction.process", () => {
+@@ -904,166 +1141,957 @@ describe("session.compaction.process", () => {
      }).pipe(withCompaction({ result: "compact" })),
    )
  
-+  itCompaction.instance(
+-  it.instance(
+-    "adds synthetic continue prompt when auto is enabled",
+-    Effect.gen(function* () {
+-      const ssn = yield* SessionNs.Service
+-      const session = yield* ssn.create({})
+-      const msg = yield* createUserMessage(session.id, "hello")
+-      const msgs = yield* ssn.messages({ sessionID: session.id })
+-
+-      const result = yield* SessionCompaction.use.process({
+-        parentID: msg.id,
+-        messages: msgs,
+-        sessionID: session.id,
+-        auto: true,
+-      })
+-
+-      const all = yield* ssn.messages({ sessionID: session.id })
+-      const last = all.at(-1)
+-
+-      expect(result).toBe("continue")
+-      expect(last?.info.role).toBe("user")
+-      expect(last?.parts[0]).toMatchObject({
+-        type: "text",
+-        synthetic: true,
+-        metadata: { compaction_continue: true },
+-      })
+-      if (last?.parts[0]?.type === "text") {
+-        expect(last.parts[0].text).toContain("Continue if you have next steps")
+-      }
+-    }),
+-  )
+-
+-  itCompaction.instance(
+-    "persists tail_start_id for retained recent turns",
+-    Effect.gen(function* () {
+-      const ssn = yield* SessionNs.Service
+-      const session = yield* ssn.create({})
+-      yield* createUserMessage(session.id, "first")
+-      const keep = yield* createUserMessage(session.id, "second")
+-      yield* createUserMessage(session.id, "third")
+-      yield* createSummaryCompaction(session.id)
+-
+-      const msgs = yield* ssn.messages({ sessionID: session.id })
+-      const parent = msgs.at(-1)?.info.id
+-      expect(parent).toBeTruthy()
+-      yield* SessionCompaction.use.process({
+-        parentID: parent!,
+-        messages: msgs,
+-        sessionID: session.id,
+-        auto: false,
+-      })
+-
+-      const part = yield* readCompactionPart(session.id)
+-      expect(part?.type).toBe("compaction")
+-      expect(part?.tail_start_id).toBe(keep.id)
+-    }).pipe(withCompaction({ config: cfg({ tail_turns: 2, preserve_recent_tokens: 10_000 }) })),
+-  )
+-
+-  itCompaction.instance(
+-    "shrinks retained tail to fit preserve token budget",
+-    Effect.gen(function* () {
+-      const ssn = yield* SessionNs.Service
+-      const session = yield* ssn.create({})
+-      yield* createUserMessage(session.id, "first")
+-      yield* createUserMessage(session.id, "x".repeat(2_000))
+-      const keep = yield* createUserMessage(session.id, "tiny")
+-      yield* createSummaryCompaction(session.id)
+-
+-      const msgs = yield* ssn.messages({ sessionID: session.id })
+-      const parent = msgs.at(-1)?.info.id
+-      expect(parent).toBeTruthy()
+-      yield* SessionCompaction.use.process({
+-        parentID: parent!,
+-        messages: msgs,
+-        sessionID: session.id,
+-        auto: false,
+-      })
+-
+-      const part = yield* readCompactionPart(session.id)
+-      expect(part?.type).toBe("compaction")
+-      expect(part?.tail_start_id).toBe(keep.id)
+-    }).pipe(withCompaction({ config: cfg({ tail_turns: 2, preserve_recent_tokens: 100 }) })),
+-  )
+-
+   itCompaction.instance(
+-    "falls back to full summary when even one recent turn exceeds preserve token budget",
 +    "leaves the model's reasoning out of the summary request",
-+    () => {
-+      const stub = llm()
-+      let captured = ""
-+      stub.push(reply("summary", (input) => (captured = JSON.stringify(input.messages))))
-+      return Effect.gen(function* () {
+     () => {
+       const stub = llm()
+       let captured = ""
+       stub.push(reply("summary", (input) => (captured = JSON.stringify(input.messages))))
+       return Effect.gen(function* () {
 +        const test = yield* TestInstance
-+        const ssn = yield* SessionNs.Service
-+        const session = yield* ssn.create({})
+         const ssn = yield* SessionNs.Service
+         const session = yield* ssn.create({})
+-        yield* createUserMessage(session.id, "first")
+-        yield* createUserMessage(session.id, "y".repeat(2_000))
 +        const ask = yield* createUserMessage(session.id, "question")
 +        const answer = yield* createAssistantMessage(session.id, ask.id, test.directory)
 +        yield* ssn.updatePart({
@@ -1523,39 +1692,71 @@ index c76dd98..0d7e70d 100644
 +          type: "text",
 +          text: "visible-answer",
 +        })
-+        yield* createSummaryCompaction(session.id)
-+
-+        const msgs = yield* ssn.messages({ sessionID: session.id })
+         yield* createSummaryCompaction(session.id)
+ 
+         const msgs = yield* ssn.messages({ sessionID: session.id })
+-        const parent = msgs.at(-1)?.info.id
+-        expect(parent).toBeTruthy()
+-        yield* SessionCompaction.use.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
 +        yield* SessionCompaction.use.process({
 +          parentID: msgs.at(-1)!.info.id,
 +          messages: msgs,
 +          sessionID: session.id,
 +          auto: false,
 +        })
-+
+ 
+-        const part = yield* readCompactionPart(session.id)
+-        expect(part?.type).toBe("compaction")
+-        expect(part?.tail_start_id).toBeUndefined()
+-        expect(captured).toContain("yyyy")
+-      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 20 }) }))
 +        expect(captured).toContain("visible-answer")
 +        expect(captured).not.toContain("private-thoughts")
 +      }).pipe(withCompaction({ llm: stub.llmLayer }))
-+    },
-+    { git: true },
-+  )
-+
-+  itCompaction.instance(
+     },
+     { git: true },
+   )
+ 
+   itCompaction.instance(
+-    "falls back to full summary when retained tail media exceeds preserve token budget",
 +    "shortens a summary request the model refuses as too long, keeping the opening and newest exchanges",
-+    () => {
-+      const stub = llm()
+     () => {
+       const stub = llm()
+-      let captured = ""
+-      stub.push(reply("summary", (input) => (captured = JSON.stringify(input.messages))))
 +      const requests: string[] = []
 +      const capture = (input: LLM.StreamInput) => requests.push(textOf(input))
 +      for (let i = 0; i < 3; i++) stub.push(tooLong(capture))
 +      stub.push(reply(headed("summary"), capture))
-+      return Effect.gen(function* () {
-+        const ssn = yield* SessionNs.Service
-+        const session = yield* ssn.create({})
+       return Effect.gen(function* () {
+         const ssn = yield* SessionNs.Service
+         const session = yield* ssn.create({})
+-        yield* createUserMessage(session.id, "older")
+-        const recent = yield* createUserMessage(session.id, "recent image turn")
+-        yield* ssn.updatePart({
+-          id: PartID.ascending(),
+-          messageID: recent.id,
+-          sessionID: session.id,
+-          type: "file",
+-          mime: "image/png",
+-          filename: "big.png",
+-          url: `data:image/png;base64,${"a".repeat(4_000)}`,
+-        })
 +        const errors = yield* countErrors(session.id)
 +        yield* createTurns(session.id, 6, 4_000)
-+        yield* createSummaryCompaction(session.id)
-+
-+        const msgs = yield* ssn.messages({ sessionID: session.id })
+         yield* createSummaryCompaction(session.id)
+ 
+         const msgs = yield* ssn.messages({ sessionID: session.id })
+-        const parent = msgs.at(-1)?.info.id
+-        expect(parent).toBeTruthy()
+-        yield* SessionCompaction.use.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
+-
+-        const part = yield* readCompactionPart(session.id)
+-        expect(part?.type).toBe("compaction")
+-        expect(part?.tail_start_id).toBeUndefined()
+-        expect(captured).toContain("recent image turn")
+-        expect(captured).toContain("Attached image/png: big.png")
+-      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 100 }) }))
 +        const result = yield* SessionCompaction.use.process({
 +          parentID: msgs.at(-1)!.info.id,
 +          messages: msgs,
@@ -1578,19 +1779,26 @@ index c76dd98..0d7e70d 100644
 +        ])
 +        expect(errors.count).toBe(0)
 +      }).pipe(withCompaction({ llm: stub.llmLayer }))
-+    },
-+    { git: true },
-+  )
-+
-+  itCompaction.instance(
+     },
+     { git: true },
+   )
+ 
+   itCompaction.instance(
+-    "retains a split turn suffix when a later message fits the preserve token budget",
 +    "stops with one error once every shorter summary request is refused as too long",
-+    () => {
-+      const stub = llm()
+     () => {
+       const stub = llm()
+-      let captured = ""
+-      stub.push(reply("summary", (input) => (captured = JSON.stringify(input.messages))))
 +      const requests: string[] = []
 +      for (let i = 0; i < 6; i++) stub.push(tooLong((input) => requests.push(textOf(input))))
-+      return Effect.gen(function* () {
-+        const ssn = yield* SessionNs.Service
-+        const session = yield* ssn.create({})
+       return Effect.gen(function* () {
+-        const test = yield* TestInstance
+         const ssn = yield* SessionNs.Service
+         const session = yield* ssn.create({})
+-        yield* createUserMessage(session.id, "older")
+-        const recent = yield* createUserMessage(session.id, "recent turn")
+-        const large = yield* createAssistantMessage(session.id, recent.id, test.directory)
 +        const errors = yield* countErrors(session.id)
 +        yield* createTurns(session.id, 8, 4_000)
 +        yield* createSummaryCompaction(session.id)
@@ -1692,7 +1900,7 @@ index c76dd98..0d7e70d 100644
 +
 +        expect(result).toBe("continue")
 +        expect(requests).toHaveLength(2)
-+        expect(requests[0].maxOutputTokens).toBe(32_000)
++        expect(requests[0].maxOutputTokens).toBe(128_000)
 +        expect(textOf(requests[1]).length).toBeLessThan(textOf(requests[0]).length / 4)
 +        expect(requests[1].maxOutputTokens).toBeLessThan(20_000)
 +      }).pipe(withCompaction({ llm: stub.llmLayer, provider: big, outputTokenMax: 128_000 }))
@@ -1752,7 +1960,7 @@ index c76dd98..0d7e70d 100644
 +  )
 +
 +  itCompaction.instance(
-+    "caps live summary maxOutputTokens at 32k even with 128k outputTokenMax and keeps estimate margin",
++    "gives a live summary the room the window leaves instead of a fixed cap, and keeps the estimate margin",
 +    () => {
 +      const stub = llm()
 +      const requests: LLM.StreamInput[] = []
@@ -1788,7 +1996,9 @@ index c76dd98..0d7e70d 100644
 +        })
 +
 +        expect(requests).toHaveLength(2)
-+        expect(requests[0].maxOutputTokens).toBe(32_000)
++        // 900,010 measured tokens and the prompt's estimated 1.4k leave about 98k of the window.
++        expect(requests[0].maxOutputTokens!).toBeGreaterThan(90_000)
++        expect(requests[0].maxOutputTokens!).toBeLessThanOrEqual(1_000_000 - 900_010)
 +        // 120k chars ≈ 30k estimated tokens -> 1.4x margin reserves >= 42k, leaving <= 18k of the 60k gap.
 +        expect(requests[1].maxOutputTokens!).toBeLessThanOrEqual(18_000)
 +        expect(requests[1].maxOutputTokens!).toBeGreaterThanOrEqual(1_024)
@@ -1958,6 +2168,39 @@ index c76dd98..0d7e70d 100644
 +  )
 +
 +  itCompaction.instance(
++    "fails the compaction instead of keeping a summary that is empty or was cut off at the output limit",
++    () => {
++      const stub = llm()
++      const cases = [empty, cutOff]
++      for (const attempt of cases) stub.push(attempt())
++      return Effect.gen(function* () {
++        const ssn = yield* SessionNs.Service
++        for (const _ of cases) {
++          const session = yield* ssn.create({})
++          const errors = yield* countErrors(session.id)
++          yield* createTurns(session.id, 2)
++          yield* createSummaryCompaction(session.id)
++
++          const msgs = yield* ssn.messages({ sessionID: session.id })
++          const result = yield* SessionCompaction.use.process({
++            parentID: msgs.at(-1)!.info.id,
++            messages: msgs,
++            sessionID: session.id,
++            auto: false,
++          })
++          const summary = yield* summaryOf(session.id)
++
++          expect(result).toBe("stop")
++          expect(summary?.info.role === "assistant" && summary.info.finish).toBe("error")
++          expect(summary?.info.role === "assistant" && summary.info.error !== undefined).toBe(true)
++          expect(errors.count).toBe(1)
++        }
++      }).pipe(withCompaction({ llm: stub.llmLayer }))
++    },
++    { git: true },
++  )
++
++  itCompaction.instance(
 +    "reminds the model of the template once and keeps its first summary when that does not help",
 +    () => {
 +      const stub = llm()
@@ -2101,7 +2344,7 @@ index c76dd98..0d7e70d 100644
 +      const requests: string[] = []
 +      const capture = (input: LLM.StreamInput) => requests.push(textOf(input))
 +      const plain = (capture: (input: LLM.StreamInput) => void) => reply("plain", capture)
-+      const cases = [[toolCall], [empty], [tooLong], [plain, plain]]
++      const cases = [[toolCall], [empty], [cutOff], [tooLong], [plain, plain]]
 +      for (const attempts of cases) {
 +        for (const attempt of attempts) stub.push(attempt(capture))
 +        stub.push(reply(headed("text summary"), capture))
@@ -2252,10 +2495,170 @@ index c76dd98..0d7e70d 100644
 +    ),
 +  )
 +
-   it.instance(
-     "adds synthetic continue prompt when auto is enabled",
-     Effect.gen(function* () {
-@@ -1357,16 +2319,26 @@ describe("session.compaction.process", () => {
++  it.instance(
++    "adds synthetic continue prompt when auto is enabled",
++    Effect.gen(function* () {
++      const ssn = yield* SessionNs.Service
++      const session = yield* ssn.create({})
++      const msg = yield* createUserMessage(session.id, "hello")
++      const msgs = yield* ssn.messages({ sessionID: session.id })
++
++      const result = yield* SessionCompaction.use.process({
++        parentID: msg.id,
++        messages: msgs,
++        sessionID: session.id,
++        auto: true,
++      })
++
++      const all = yield* ssn.messages({ sessionID: session.id })
++      const last = all.at(-1)
++
++      expect(result).toBe("continue")
++      expect(last?.info.role).toBe("user")
++      expect(last?.parts[0]).toMatchObject({
++        type: "text",
++        synthetic: true,
++        metadata: { compaction_continue: true },
++      })
++      if (last?.parts[0]?.type === "text") {
++        expect(last.parts[0].text).toContain("Continue if you have next steps")
++      }
++    }),
++  )
++
++  itCompaction.instance(
++    "persists tail_start_id for retained recent turns",
++    Effect.gen(function* () {
++      const ssn = yield* SessionNs.Service
++      const session = yield* ssn.create({})
++      yield* createUserMessage(session.id, "first")
++      const keep = yield* createUserMessage(session.id, "second")
++      yield* createUserMessage(session.id, "third")
++      yield* createSummaryCompaction(session.id)
++
++      const msgs = yield* ssn.messages({ sessionID: session.id })
++      const parent = msgs.at(-1)?.info.id
++      expect(parent).toBeTruthy()
++      yield* SessionCompaction.use.process({
++        parentID: parent!,
++        messages: msgs,
++        sessionID: session.id,
++        auto: false,
++      })
++
++      const part = yield* readCompactionPart(session.id)
++      expect(part?.type).toBe("compaction")
++      expect(part?.tail_start_id).toBe(keep.id)
++    }).pipe(withCompaction({ config: cfg({ tail_turns: 2, preserve_recent_tokens: 10_000 }) })),
++  )
++
++  itCompaction.instance(
++    "shrinks retained tail to fit preserve token budget",
++    Effect.gen(function* () {
++      const ssn = yield* SessionNs.Service
++      const session = yield* ssn.create({})
++      yield* createUserMessage(session.id, "first")
++      yield* createUserMessage(session.id, "x".repeat(2_000))
++      const keep = yield* createUserMessage(session.id, "tiny")
++      yield* createSummaryCompaction(session.id)
++
++      const msgs = yield* ssn.messages({ sessionID: session.id })
++      const parent = msgs.at(-1)?.info.id
++      expect(parent).toBeTruthy()
++      yield* SessionCompaction.use.process({
++        parentID: parent!,
++        messages: msgs,
++        sessionID: session.id,
++        auto: false,
++      })
++
++      const part = yield* readCompactionPart(session.id)
++      expect(part?.type).toBe("compaction")
++      expect(part?.tail_start_id).toBe(keep.id)
++    }).pipe(withCompaction({ config: cfg({ tail_turns: 2, preserve_recent_tokens: 100 }) })),
++  )
++
++  itCompaction.instance(
++    "falls back to full summary when even one recent turn exceeds preserve token budget",
++    () => {
++      const stub = llm()
++      let captured = ""
++      stub.push(reply("summary", (input) => (captured = JSON.stringify(input.messages))))
++      return Effect.gen(function* () {
++        const ssn = yield* SessionNs.Service
++        const session = yield* ssn.create({})
++        yield* createUserMessage(session.id, "first")
++        yield* createUserMessage(session.id, "y".repeat(2_000))
++        yield* createSummaryCompaction(session.id)
++
++        const msgs = yield* ssn.messages({ sessionID: session.id })
++        const parent = msgs.at(-1)?.info.id
++        expect(parent).toBeTruthy()
++        yield* SessionCompaction.use.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
++
++        const part = yield* readCompactionPart(session.id)
++        expect(part?.type).toBe("compaction")
++        expect(part?.tail_start_id).toBeUndefined()
++        expect(captured).toContain("yyyy")
++      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 20 }) }))
++    },
++    { git: true },
++  )
++
++  itCompaction.instance(
++    "falls back to full summary when retained tail media exceeds preserve token budget",
++    () => {
++      const stub = llm()
++      let captured = ""
++      stub.push(reply("summary", (input) => (captured = JSON.stringify(input.messages))))
++      return Effect.gen(function* () {
++        const ssn = yield* SessionNs.Service
++        const session = yield* ssn.create({})
++        yield* createUserMessage(session.id, "older")
++        const recent = yield* createUserMessage(session.id, "recent image turn")
++        yield* ssn.updatePart({
++          id: PartID.ascending(),
++          messageID: recent.id,
++          sessionID: session.id,
++          type: "file",
++          mime: "image/png",
++          filename: "big.png",
++          url: `data:image/png;base64,${"a".repeat(4_000)}`,
++        })
++        yield* createSummaryCompaction(session.id)
++
++        const msgs = yield* ssn.messages({ sessionID: session.id })
++        const parent = msgs.at(-1)?.info.id
++        expect(parent).toBeTruthy()
++        yield* SessionCompaction.use.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
++
++        const part = yield* readCompactionPart(session.id)
++        expect(part?.type).toBe("compaction")
++        expect(part?.tail_start_id).toBeUndefined()
++        expect(captured).toContain("recent image turn")
++        expect(captured).toContain("Attached image/png: big.png")
++      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 100 }) }))
++    },
++    { git: true },
++  )
++
++  itCompaction.instance(
++    "retains a split turn suffix when a later message fits the preserve token budget",
++    () => {
++      const stub = llm()
++      let captured = ""
++      stub.push(reply("summary", (input) => (captured = JSON.stringify(input.messages))))
++      return Effect.gen(function* () {
++        const test = yield* TestInstance
++        const ssn = yield* SessionNs.Service
++        const session = yield* ssn.create({})
++        yield* createUserMessage(session.id, "older")
++        const recent = yield* createUserMessage(session.id, "recent turn")
++        const large = yield* createAssistantMessage(session.id, recent.id, test.directory)
+         yield* ssn.updatePart({
+           id: PartID.ascending(),
+           messageID: large.id,
+@@ -1357,16 +2385,26 @@ describe("session.compaction.process", () => {
        return Effect.gen(function* () {
          const ssn = yield* SessionNs.Service
          const session = yield* ssn.create({})
@@ -2283,7 +2686,7 @@ index c76dd98..0d7e70d 100644
        }).pipe(withCompaction({ llm: stub.llmLayer }))
      },
      { git: true },
-@@ -1427,9 +2399,9 @@ describe("session.compaction.process", () => {
+@@ -1427,9 +2465,9 @@ describe("session.compaction.process", () => {
      () => {
        const stub = llm()
        let captured = ""
@@ -2295,7 +2698,7 @@ index c76dd98..0d7e70d 100644
            captured = JSON.stringify(input.messages)
          }),
        )
-@@ -1579,8 +2551,8 @@ describe("session.compaction.process", () => {
+@@ -1579,8 +2617,8 @@ describe("session.compaction.process", () => {
  
    itCompaction.instance("keeps recent pre-compaction turns across repeated compactions", () => {
      const stub = llm()

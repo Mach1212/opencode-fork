@@ -24,7 +24,9 @@ When nothing is carried, the release holds upstream's archive unchanged.
   first asked for with the conversation's own request, which reuses its prompt cache, while
   that request leaves room for the summary. Otherwise, or when that reply is unusable, the
   history goes as a text transcript without the model's reasoning, shortened oldest first to
-  fit, and shortened further each time the model refuses it as too long.
+  fit, and shortened further each time the model refuses it as too long. A summary may use the
+  output room the window leaves. One that was cut off at the output limit, or is empty, fails
+  the compaction instead of standing in for the history.
 
 ## How it follows upstream
 
