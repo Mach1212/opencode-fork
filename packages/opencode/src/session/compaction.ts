@@ -42,8 +42,6 @@ const RESERVE_MIN = 16_000
 const RESERVE_SHARE = 0.15
 /** A common window size, assumed for the summary request when the model's window is unknown. */
 const UNKNOWN_WINDOW = 200_000
-/** Cap summary output even when global outputTokenMax is raised (e.g. 128k), leaving headroom for live cache hits. */
-const SUMMARY_OUTPUT_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 const OUTPUT_TOKEN_MIN = 1_024
 /**
  * `Token.estimate` uses ~4 characters per token, while dense text and code on Claude/GPT tokenizers
@@ -265,15 +263,16 @@ const summaryRoom = (limit: Provider.Model["limit"], output: number) =>
   Math.max(0, inputWindow(limit) - Math.min(RESERVE_MIN, output))
 
 /**
- * The output limit for a summary request of `input` tokens: capped at `SUMMARY_OUTPUT_MAX` and the remaining room
+ * The output limit for a summary request of `input` tokens: the model's own, lowered to the room the request leaves
  * in the effective context window after scaling estimated tokens by `ESTIMATE_ERROR` (or observed provider density).
+ * Thinking counts against the limit, so a fixed cap below that room can end a summary before it has written a word.
  */
 const fitOutput = (
   model: Provider.Model,
   outputTokenMax: number | undefined,
   input: { measured: number; estimated: number; context?: number; scale?: number },
 ) => {
-  const requested = Math.min(ProviderTransform.maxOutputTokens(model, outputTokenMax), SUMMARY_OUTPUT_MAX)
+  const requested = ProviderTransform.maxOutputTokens(model, outputTokenMax)
   const context = input.context ?? model.limit.context
   if (context <= 0) return requested
   const scale = Math.max(1 + ESTIMATE_ERROR, input.scale ?? 1 + ESTIMATE_ERROR)
@@ -733,8 +732,9 @@ const layer = Layer.effect(
         msg.time.completed = undefined
         yield* session.updateMessage(msg)
       })
+      // A reply that ran out of output tokens is not a summary: thinking may have used them all, or the text stops short.
       const usable = (result: SessionProcessor.Result) =>
-        result === "continue" && !msg.error && msg.finish !== "tool-calls"
+        result === "continue" && !msg.error && msg.finish !== "tool-calls" && msg.finish !== "length"
       let effectiveContext = model.limit.context
       let effectiveWindow = inputWindow(model.limit) || UNKNOWN_WINDOW
       let observedScale = 1 + ESTIMATE_ERROR
@@ -802,10 +802,7 @@ const layer = Layer.effect(
         }
         const room = Math.max(
           ceiling(effectiveWindow),
-          summaryRoom(
-            model.limit,
-            Math.min(ProviderTransform.maxOutputTokens(model, flags.outputTokenMax), SUMMARY_OUTPUT_MAX),
-          ),
+          summaryRoom(model.limit, ProviderTransform.maxOutputTokens(model, flags.outputTokenMax)),
         )
         if (size.measured + Math.ceil((size.estimated + Token.estimate(NUDGE)) * observedScale) > room)
           return "fallback" as const
@@ -926,9 +923,12 @@ const layer = Layer.effect(
             continue
           }
           if (msg.finish === "tool-calls") return "tool-calls" as const
+          if (!msg.error && msg.finish === "length") return "cut-off" as const
           if (!usable(result)) return "error" as const
           const first = yield* reply()
-          if (!first || compacting.prompt !== undefined || filled(first, TEXT_HEADINGS)) return "summarized" as const
+          // Kept as a summary, either would stand in for the whole history; failed, the next turn asks again.
+          if (!first) return "empty" as const
+          if (compacting.prompt !== undefined || filled(first, TEXT_HEADINGS)) return "summarized" as const
           // One reminder; if it does not help, the first summary is kept rather than none at all.
           const kept = { parts: yield* parts(), finish: msg.finish, tokens: msg.tokens }
           yield* reset()
@@ -958,6 +958,14 @@ const layer = Layer.effect(
           msg.error = new NamedError.Unknown({
             message: "Compaction failed: the model called a tool instead of writing the summary",
           }).toObject()
+        }
+        if (outcome === "cut-off") {
+          msg.error = new NamedError.Unknown({
+            message: "Compaction failed: the summary ran out of output tokens",
+          }).toObject()
+        }
+        if (outcome === "empty") {
+          msg.error = new NamedError.Unknown({ message: "Compaction failed: the model wrote no summary" }).toObject()
         }
         if (outcome !== "error") msg.finish = "error"
         msg.time.completed ??= Date.now()
